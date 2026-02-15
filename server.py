@@ -91,25 +91,26 @@ async def research_resource(topic: str) -> str:
 
 
 @mcp.tool()
-async def deep_research(query: str) -> Dict[str, Any]:
+async def deep_research(query: str, retriever: str = "smart") -> Dict[str, Any]:
     """
-    Conduct a web deep research on a given query using GPT Researcher. 
+    Conduct a web deep research on a given query using GPT Researcher.
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
-    
+
     Args:
         query: The research query or topic
-        
+        retriever: Search retriever to use (e.g. "smart", "tavily", "duckduckgo"). Defaults to "smart" which auto-selects optimal retrievers per query type.
+
     Returns:
         Dict containing research status, ID, and the actual research context and sources
         that can be used directly by LLMs for context enrichment
     """
-    logger.info(f"Conducting research on query: {query}...")
-    
+    logger.info(f"Conducting research on query: {query} (retriever={retriever})...")
+
     # Generate a unique ID for this research session
     research_id = str(uuid.uuid4())
-    
+
     # Initialize GPT Researcher
-    researcher = GPTResearcher(query)
+    researcher = GPTResearcher(query, retriever=retriever)
     
     # Start research
     try:
