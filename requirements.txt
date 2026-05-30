@@ -1,6 +1,8 @@
 # GPT Researcher dependencies
 gpt-researcher>=0.14.0
 python-dotenv
+langchain-google-genai>=4.2.3  # ChatGoogleGenerativeAI for gemini-3.5-flash
+ddgs  # DuckDuckGo retriever (keyless fallback when Tavily fails / no API key)
 
 # MCP dependencies
 fastmcp>=2.8.0
