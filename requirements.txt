@@ -4,6 +4,11 @@ python-dotenv
 langchain-google-genai>=4.2.3  # ChatGoogleGenerativeAI for gemini-3.5-flash
 ddgs  # DuckDuckGo retriever (keyless fallback when Tavily fails / no API key)
 
+# Claude Agent SDK — routes FAST/SMART/STRATEGIC LLMs through the Claude
+# subscription session (CLI OAuth) instead of the metered API. Requires Node +
+# the `claude` CLI baked into the image (see Dockerfile).
+claude-agent-sdk>=0.1.48
+
 # MCP dependencies
 fastmcp>=2.8.0
 fastapi>=0.103.1
