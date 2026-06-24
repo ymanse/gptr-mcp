@@ -20,13 +20,15 @@ load_dotenv()
 
 from utils import (
     research_store,
-    create_success_response, 
+    create_success_response,
     handle_exception,
-    get_researcher_by_id, 
+    get_researcher_by_id,
     format_sources_for_response,
-    format_context_with_sources, 
+    format_context_with_sources,
     store_research_results,
-    create_research_prompt
+    create_research_prompt,
+    normalize_context,
+    persist_research_artifacts,
 )
 
 logging.basicConfig(
@@ -91,7 +93,7 @@ async def research_resource(topic: str) -> str:
 
 
 @mcp.tool()
-async def deep_research(query: str, retriever: str = "smart") -> Dict[str, Any]:
+async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False) -> Dict[str, Any]:
     """
     Conduct a web deep research on a given query using GPT Researcher.
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
@@ -99,40 +101,66 @@ async def deep_research(query: str, retriever: str = "smart") -> Dict[str, Any]:
     Args:
         query: The research query or topic
         retriever: Search retriever to use (e.g. "smart", "tavily", "duckduckgo"). Defaults to "smart" which auto-selects optimal retrievers per query type.
+        multi_llm_review: Enable multi-LLM consensus review (Gemini + ChatGPT + Claude review research for gaps and deeper exploration). Defaults to False.
 
     Returns:
         Dict containing research status, ID, and the actual research context and sources
         that can be used directly by LLMs for context enrichment
     """
-    logger.info(f"Conducting research on query: {query} (retriever={retriever})...")
+    logger.info(f"Conducting research on query: {query} (retriever={retriever}, multi_llm_review={multi_llm_review})...")
+
+    # Save and set environment variables (GPTResearcher reads config from env,
+    # NOT as constructor kwargs — passing them as kwargs leaks into LLM API calls)
+    prev_retriever = os.environ.get("RETRIEVER")
+    prev_multi_llm = os.environ.get("MULTI_LLM_REVIEW_ENABLED")
+
+    if multi_llm_review:
+        os.environ["MULTI_LLM_REVIEW_ENABLED"] = "true"
+    if retriever:
+        os.environ["RETRIEVER"] = retriever
 
     # Generate a unique ID for this research session
     research_id = str(uuid.uuid4())
 
     # Initialize GPT Researcher
-    researcher = GPTResearcher(query, retriever=retriever)
-    
+    researcher = GPTResearcher(query)
+
+    # Restore previous env vars to avoid side effects between calls
+    for key, prev_val in [("RETRIEVER", prev_retriever), ("MULTI_LLM_REVIEW_ENABLED", prev_multi_llm)]:
+        if prev_val is not None:
+            os.environ[key] = prev_val
+        elif key in os.environ:
+            del os.environ[key]
+
     # Start research
     try:
         await researcher.conduct_research()
         mcp.researchers[research_id] = researcher
         logger.info(f"Research completed for ID: {research_id}")
-        
-        # Get the research context and sources
-        context = researcher.get_research_context()
+
+        # Get the research context and sources. get_research_context() can return a
+        # list (see gpt_researcher agent), which breaks FastMCP serialization — normalize.
+        context = normalize_context(researcher.get_research_context())
         sources = researcher.get_research_sources()
         source_urls = researcher.get_source_urls()
-        
+
         # Store in the research store for the resource API
         store_research_results(query, context, sources, source_urls)
-        
+
+        # Artifact pattern: write the full context + sources to disk and return only a
+        # compact preview + file paths, so the (potentially 70KB+) context never gets
+        # dumped into the model context as a single-line JSON blob.
+        artifacts = persist_research_artifacts(
+            query, context, sources, source_urls, research_id
+        )
+
         return create_success_response({
             "research_id": research_id,
             "query": query,
             "source_count": len(sources),
-            "context": context,
             "sources": format_sources_for_response(sources),
-            "source_urls": source_urls
+            "source_urls": source_urls,
+            **artifacts,
         })
     except Exception as e:
         return handle_exception(e, "Research")
@@ -196,15 +224,25 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
     try:
         # Generate report
         report = await researcher.write_report(custom_prompt=custom_prompt)
-        
+
         # Get additional information
         sources = researcher.get_research_sources()
+        source_urls = researcher.get_source_urls()
         costs = researcher.get_costs()
-        
+        query = getattr(researcher, "query", research_id)
+
+        # Artifact pattern: the report (already Markdown) is written to disk verbatim;
+        # only a preview + paths are returned inline.
+        artifacts = persist_research_artifacts(
+            query, report, sources, source_urls, research_id,
+            report_text=report, costs=costs,
+        )
+
         return create_success_response({
-            "report": report,
+            "research_id": research_id,
             "source_count": len(sources),
-            "costs": costs
+            "costs": costs,
+            **artifacts,
         })
     except Exception as e:
         return handle_exception(e, "Report generation")
@@ -249,10 +287,21 @@ async def get_research_context(research_id: str) -> Dict[str, Any]:
     if not success:
         return error
     
-    context = researcher.get_research_context()
-    
+    context = normalize_context(researcher.get_research_context())
+    sources = researcher.get_research_sources()
+    source_urls = researcher.get_source_urls()
+    query = getattr(researcher, "query", research_id)
+
+    # Artifact pattern: persist the full context and return a preview + paths instead of
+    # dumping the whole context inline. Set GPTR_MCP_INLINE_CONTEXT=true to get it inline.
+    artifacts = persist_research_artifacts(
+        query, context, sources, source_urls, research_id
+    )
+
     return create_success_response({
-        "context": context
+        "research_id": research_id,
+        "source_count": len(sources),
+        **artifacts,
     })
 
 
@@ -283,12 +332,18 @@ def run_server():
         return
 
     # Determine transport based on environment
-    transport = os.getenv("MCP_TRANSPORT", "stdio").lower()
+    transport = os.getenv("MCP_TRANSPORT", "stdio").lower().replace("_", "-")
+    host = os.getenv("MCP_HOST", "0.0.0.0")
+    port = int(os.getenv("MCP_PORT", "8000"))
+    http_path = os.getenv("MCP_PATH")
     
-    # Auto-detect Docker environment
-    if os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER"):
-        transport = "sse"
-        logger.info("Docker environment detected, using SSE transport")
+    # Auto-detect Docker environment (only override if transport is default stdio)
+    if transport == "stdio" and (os.path.exists("/.dockerenv") or os.getenv("DOCKER_CONTAINER")):
+        transport = "streamable-http"
+        logger.info("Docker environment detected, using Streamable HTTP transport")
+
+    if transport == "http":
+        transport = "streamable-http"
     
     # Add startup message
     logger.info(f"Starting GPT Researcher MCP Server with {transport} transport...")
@@ -301,9 +356,9 @@ def run_server():
             logger.info("Using STDIO transport (Claude Desktop compatible)")
             mcp.run(transport="stdio")
         elif transport == "sse":
-            mcp.run(transport="sse", host="0.0.0.0", port=8000)
+            mcp.run(transport="sse", host=host, port=port, path=http_path or "/sse")
         elif transport == "streamable-http":
-            mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
+            mcp.run(transport="streamable-http", host=host, port=port, path=http_path or "/mcp")
         else:
             raise ValueError(f"Unsupported transport: {transport}")
             

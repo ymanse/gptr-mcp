@@ -4,7 +4,12 @@ GPT Researcher MCP Server Utilities
 This module provides utility functions and helpers for the GPT Researcher MCP Server.
 """
 
+import os
+import re
 import sys
+import json
+from pathlib import Path
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
 from loguru import logger
 
@@ -13,6 +18,9 @@ logger.configure(handlers=[{"sink": sys.stderr, "level": "INFO"}])
 
 # Research store to track ongoing research topics and contexts
 research_store = {}
+
+# Number of characters of context/report exposed inline as a preview.
+PREVIEW_CHARS = int(os.getenv("GPTR_MCP_PREVIEW_CHARS", "1200"))
 
 # API Response Utilities
 def create_error_response(message: str) -> Dict[str, Any]:
@@ -134,6 +142,167 @@ def create_research_prompt(topic: str, goal: str, report_format: str = "research
     After getting context, you can:
     - Use it directly in your response
     - Use the write_report tool with a custom prompt to generate a structured {report_format}
-    
+
     You can also use get_research_sources to view additional details about the information sources.
-    """ 
+    """
+
+
+# Artifact Persistence Utilities
+#
+# Large research results (context / report / sources-with-content) are written to
+# disk and only a compact metadata + preview is returned inline. This keeps the MCP
+# response small (no 70KB single-line JSON dumped into the model context) while the
+# full output stays available as a clean, grep-able file the caller can open on demand.
+
+def normalize_context(context_raw: Any) -> str:
+    """
+    Normalize a research context to a single string.
+
+    get_research_context() may return a list (see gpt_researcher agent), which breaks
+    FastMCP dict serialization ("'list' object is not an instance of 'str'"). Collapse
+    any non-str shape into a stable string here.
+    """
+    if isinstance(context_raw, str):
+        return context_raw
+    if context_raw is None:
+        return ""
+    if isinstance(context_raw, list):
+        return "\n\n".join(
+            item if isinstance(item, str) else str(item) for item in context_raw
+        )
+    return str(context_raw)
+
+
+def get_output_dir() -> Path:
+    """
+    Resolve (and create) the directory where research artifacts are written.
+
+    Override with GPTR_MCP_OUTPUT_DIR; defaults to ``<server>/outputs`` next to this
+    module so paths returned to the caller are absolute and stable.
+    """
+    base = os.getenv("GPTR_MCP_OUTPUT_DIR")
+    out = Path(base) if base else (Path(__file__).resolve().parent / "outputs")
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _to_host_path(filename: str, write_dir: Path) -> str:
+    """
+    Build the path the CALLER should open.
+
+    When the server runs in a container, the real write dir (e.g. /app/outputs) is not
+    readable from the host. GPTR_MCP_OUTPUT_DIR_HOST names the host-visible location that
+    the write dir is bind-mounted to, so the returned path points there instead. Unset
+    (native run) -> return the actual write path.
+    """
+    host_base = os.getenv("GPTR_MCP_OUTPUT_DIR_HOST")
+    if not host_base:
+        return str(write_dir / filename)
+    host_base = host_base.rstrip("/\\")
+    sep = "\\" if ("\\" in host_base or re.match(r"^[A-Za-z]:", host_base)) else "/"
+    return f"{host_base}{sep}{filename}"
+
+
+def _slugify(text: str, max_len: int = 40) -> str:
+    """Filesystem-safe, human-readable slug for use in artifact filenames."""
+    slug = re.sub(r"[^\w\s-]", "", text or "", flags=re.UNICODE).strip().lower()
+    slug = re.sub(r"[\s_-]+", "-", slug)
+    return slug[:max_len].strip("-") or "research"
+
+
+def build_report_markdown(
+    query: str,
+    context: str,
+    sources: List[Dict[str, Any]],
+    source_urls: List[str],
+    research_id: str,
+    costs: Any = None,
+) -> str:
+    """Render context + sources as a readable, grep-able Markdown report (L2)."""
+    lines = [f"# Research: {query}", ""]
+    lines.append(f"- research_id: `{research_id}`")
+    lines.append(f"- generated: {datetime.now().isoformat(timespec='seconds')}")
+    lines.append(f"- sources: {len(sources or [])}")
+    if costs is not None:
+        lines.append(f"- costs: {costs}")
+    lines.extend(["", "## Context", "", context if context else "_(empty)_", "", "## Sources", ""])
+    if sources:
+        for i, s in enumerate(sources, 1):
+            lines.append(f"{i}. [{s.get('title', 'Unknown')}]({s.get('url', '')})")
+    else:
+        for i, u in enumerate(source_urls or [], 1):
+            lines.append(f"{i}. {u}")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def persist_research_artifacts(
+    query: str,
+    context: Any,
+    sources: List[Dict[str, Any]],
+    source_urls: List[str],
+    research_id: str,
+    *,
+    report_text: Optional[str] = None,
+    costs: Any = None,
+) -> Dict[str, Any]:
+    """
+    Write the full research output to disk and return compact inline metadata.
+
+    Files written (under get_output_dir(), stem = ``<slug>-<short_id>``):
+      - ``<stem>.md``           : Markdown report (context + sources)        [L2]
+      - ``<stem>.sources.json`` : full sources incl. content, pretty JSON    [L3]
+
+    Returned dict (merged into the tool's success response) contains only paths,
+    counts and a bounded preview — never the full body, unless GPTR_MCP_INLINE_CONTEXT
+    is truthy (escape hatch to restore the old inline behavior).
+    """
+    out_dir = get_output_dir()
+    stem = f"{_slugify(query)}-{research_id[:8]}"
+    context = normalize_context(context)
+
+    report_name = f"{stem}.md"
+    sources_name = f"{stem}.sources.json"
+
+    # L2: Markdown report. For write_report, report_text is already Markdown — use it verbatim.
+    report_md = report_text if report_text is not None else build_report_markdown(
+        query, context, sources, source_urls, research_id, costs=costs
+    )
+    report_path = out_dir / report_name
+    report_path.write_text(report_md, encoding="utf-8")
+
+    # L3: full sources (with raw content) as pretty, multi-line JSON.
+    sources_path = out_dir / sources_name
+    sources_path.write_text(
+        json.dumps(
+            {
+                "query": query,
+                "research_id": research_id,
+                "source_urls": source_urls,
+                "sources": sources,
+            },
+            indent=2,
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    preview_source = report_text if report_text is not None else context
+    meta: Dict[str, Any] = {
+        "report_path": _to_host_path(report_name, out_dir),
+        "sources_path": _to_host_path(sources_name, out_dir),
+        "context_chars": len(context),
+        "context_words": len(context.split()),
+        "context_preview": preview_source[:PREVIEW_CHARS],
+        "truncated": len(preview_source) > PREVIEW_CHARS,
+    }
+
+    # Escape hatch: GPTR_MCP_INLINE_CONTEXT=true restores full inline context.
+    if os.getenv("GPTR_MCP_INLINE_CONTEXT", "false").strip().lower() in ("1", "true", "yes"):
+        meta["context"] = context
+
+    logger.info(
+        f"Persisted research artifacts: {report_path.name} "
+        f"({len(context)} chars, {len(sources or [])} sources)"
+    )
+    return meta
