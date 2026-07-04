@@ -70,7 +70,7 @@ def format_sources_for_response(sources: List[Dict[str, Any]]) -> List[Dict[str,
         {
             "title": source.get("title", "Unknown"),
             "url": source.get("url", ""),
-            "content_length": len(source.get("content", ""))
+            "content_length": len(source.get("content") or source.get("raw_content") or "")
         }
         for source in sources
     ]
@@ -245,6 +245,7 @@ def persist_research_artifacts(
     *,
     report_text: Optional[str] = None,
     costs: Any = None,
+    verification: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Write the full research output to disk and return compact inline metadata.
@@ -280,6 +281,7 @@ def persist_research_artifacts(
                 "research_id": research_id,
                 "source_urls": source_urls,
                 "sources": sources,
+                "verification": verification,
             },
             indent=2,
             ensure_ascii=False,

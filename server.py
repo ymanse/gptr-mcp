@@ -30,6 +30,7 @@ from utils import (
     normalize_context,
     persist_research_artifacts,
 )
+from verification import verify_research
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,7 +94,7 @@ async def research_resource(topic: str) -> str:
 
 
 @mcp.tool()
-async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False) -> Dict[str, Any]:
+async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False) -> Dict[str, Any]:
     """
     Conduct a web deep research on a given query using GPT Researcher.
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
@@ -102,6 +103,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         query: The research query or topic
         retriever: Search retriever to use (e.g. "smart", "tavily", "duckduckgo"). Defaults to "smart" which auto-selects optimal retrievers per query type.
         multi_llm_review: Enable multi-LLM consensus review (Gemini + ChatGPT + Claude review research for gaps and deeper exploration). Defaults to False.
+        verify: Run a post-research verification pass — source tiering (L1-L4 credibility) + faithfulness audit (unsupported-claim + contradiction detection). Complements multi_llm_review (which fills gaps). Off by default; also enabled globally via GPTR_MCP_VERIFY=true.
 
     Returns:
         Dict containing research status, ID, and the actual research context and sources
@@ -144,6 +146,15 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         sources = researcher.get_research_sources()
         source_urls = researcher.get_source_urls()
 
+        # Optional post-research verification (source tiering + faithfulness audit).
+        # Off by default; enable per-call (verify=true) or globally (GPTR_MCP_VERIFY=true).
+        verification = None
+        if verify or os.getenv("GPTR_MCP_VERIFY", "false").strip().lower() in ("1", "true", "yes"):
+            try:
+                verification = await verify_research(researcher, query, context, sources)
+            except Exception as e:
+                logger.warning(f"Verification pass failed: {e}")
+
         # Store in the research store for the resource API
         store_research_results(query, context, sources, source_urls)
 
@@ -151,7 +162,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         # compact preview + file paths, so the (potentially 70KB+) context never gets
         # dumped into the model context as a single-line JSON blob.
         artifacts = persist_research_artifacts(
-            query, context, sources, source_urls, research_id
+            query, context, sources, source_urls, research_id, verification=verification
         )
 
         return create_success_response({
@@ -160,6 +171,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             "source_count": len(sources),
             "sources": format_sources_for_response(sources),
             "source_urls": source_urls,
+            "verification": verification,
             **artifacts,
         })
     except Exception as e:
