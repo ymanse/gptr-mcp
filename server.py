@@ -94,7 +94,7 @@ async def research_resource(topic: str) -> str:
 
 
 @mcp.tool()
-async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False) -> Dict[str, Any]:
+async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False, scope: bool = False) -> Dict[str, Any]:
     """
     Conduct a web deep research on a given query using GPT Researcher.
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
@@ -104,6 +104,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         retriever: Search retriever to use (e.g. "smart", "tavily", "duckduckgo"). Defaults to "smart" which auto-selects optimal retrievers per query type.
         multi_llm_review: Enable multi-LLM consensus review (Gemini + ChatGPT + Claude review research for gaps and deeper exploration). Defaults to False.
         verify: Run a post-research verification pass — source tiering (L1-L4 credibility) + faithfulness audit (unsupported-claim + contradiction detection). Complements multi_llm_review (which fills gaps). Off by default; also enabled globally via GPTR_MCP_VERIFY=true.
+        scope: Build a 1-round scope brief (clarification questions resolved into a scope statement) before researching, instead of auto-proceeding. Defaults to False.
 
     Returns:
         Dict containing research status, ID, and the actual research context and sources
@@ -124,8 +125,10 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
     # Generate a unique ID for this research session
     research_id = str(uuid.uuid4())
 
-    # Initialize GPT Researcher
-    researcher = GPTResearcher(query)
+    # Initialize GPT Researcher in deep mode: report_type="deep" routes
+    # conduct_research() through DeepResearchSkill (iterative breadth/depth research
+    # with learnings extraction). The default report_type only does flat web research.
+    researcher = GPTResearcher(query, report_type="deep")
 
     # Restore previous env vars to avoid side effects between calls
     for key, prev_val in [("RETRIEVER", prev_retriever), ("MULTI_LLM_REVIEW_ENABLED", prev_multi_llm)]:
@@ -136,7 +139,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
 
     # Start research
     try:
-        await researcher.conduct_research()
+        await researcher.conduct_research(scope=scope)
         mcp.researchers[research_id] = researcher
         logger.info(f"Research completed for ID: {research_id}")
 
