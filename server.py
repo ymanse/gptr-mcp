@@ -182,6 +182,74 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
 
 
 @mcp.tool()
+async def deep_tree_research(
+    query: str,
+    max_depth: int = 3,
+    max_breadth: int = 4,
+    max_nodes: int = 40,
+    token_budget: int = 300_000,
+    credit_budget: float = 150,
+    novelty_threshold: float = 0.30,
+    expansion_policy: str = "best_first",
+    stream: bool = False,
+) -> Dict[str, Any]:
+    """
+    Conduct tree-structured deep research: the answer to each research question spawns
+    follow-up questions expanded best-first into an explicit persisted node tree, with
+    novelty pruning, question-embedding dedup and post-order hierarchical synthesis.
+    Use this for broad, multi-faceted topics where a single linear deep_research pass
+    would miss follow-up threads.
+
+    Args:
+        query: The root research question
+        max_depth: Maximum tree depth below the root (default 3)
+        max_breadth: Maximum children accepted per node (default 4)
+        max_nodes: Cap on researched nodes; leftover nodes stay pending (default 40)
+        token_budget: Approximate total token budget (default 300000)
+        credit_budget: Search/scrape credit budget (default 150)
+        novelty_threshold: Nodes with novelty below this are pruned, never expanded (default 0.30)
+        expansion_policy: "best_first" (default), "bfs" or "dfs"
+        stream: Reserved for streaming progress events (default False)
+
+    Returns:
+        Dict with research status, stats, citation count and host paths of the persisted
+        tree.json + final report markdown artifacts.
+    """
+    from gpt_researcher.skills.tree_research import TreeResearchSkill
+    from utils import get_output_dir, _to_host_path
+
+    logger.info(f"Starting deep_tree_research on: {query} (max_depth={max_depth}, max_nodes={max_nodes})")
+    research_id = str(uuid.uuid4())
+    researcher = GPTResearcher(query)
+    skill = TreeResearchSkill(researcher)
+
+    try:
+        out_dir = get_output_dir()
+        result = await skill.run(
+            query=query, max_depth=max_depth, max_breadth=max_breadth,
+            max_nodes=max_nodes, token_budget=token_budget, credit_budget=credit_budget,
+            novelty_threshold=novelty_threshold, expansion_policy=expansion_policy,
+            stream=stream, outputs_dir=str(out_dir),
+        )
+        mcp.researchers[research_id] = researcher
+
+        # Artifact pattern: tree + report are on disk; return host-visible paths only.
+        artifacts = result.get("artifacts", {})
+        tree_name = os.path.basename(artifacts.get("tree_json", "")) or None
+        report_name = os.path.basename(artifacts.get("report_md", "")) or None
+        return create_success_response({
+            "research_id": research_id,
+            "query": query,
+            "stats": result["stats"],
+            "citation_count": len(result.get("citation_map", {})),
+            "tree_json_path": _to_host_path(tree_name, out_dir) if tree_name else None,
+            "report_path": _to_host_path(report_name, out_dir) if report_name else None,
+        })
+    except Exception as e:
+        return handle_exception(e, "Tree research")
+
+
+@mcp.tool()
 async def quick_search(query: str) -> Dict[str, Any]:
     """
     Perform a quick web search on a given query and return search results with snippets.
