@@ -192,6 +192,7 @@ async def deep_tree_research(
     novelty_threshold: float = 0.30,
     expansion_policy: str = "best_first",
     stream: bool = False,
+    time_budget_s: float = 600,
 ) -> Dict[str, Any]:
     """
     Conduct tree-structured deep research: the answer to each research question spawns
@@ -210,6 +211,12 @@ async def deep_tree_research(
         novelty_threshold: Nodes with novelty below this are pruned, never expanded (default 0.30)
         expansion_policy: "best_first" (default), "bfs" or "dfs"
         stream: Reserved for streaming progress events (default False)
+        time_budget_s: Wall-clock seconds for tree EXPANSION (default 600). Nodes are
+            researched sequentially at ~45s each, so this — not max_nodes — is what keeps
+            a run inside the caller's MCP idle timeout; leftover nodes stay pending and the
+            report is still synthesized. The sequential roll-up afterwards adds ~0.8x, so
+            total runtime is roughly 1.8 * this value (600 -> ~1080s, inside a 1200s idle
+            timeout). Raise it only alongside a raised client-side idle timeout.
 
     Returns:
         Dict with research status, stats, citation count and host paths of the persisted
@@ -229,7 +236,7 @@ async def deep_tree_research(
             query=query, max_depth=max_depth, max_breadth=max_breadth,
             max_nodes=max_nodes, token_budget=token_budget, credit_budget=credit_budget,
             novelty_threshold=novelty_threshold, expansion_policy=expansion_policy,
-            stream=stream, outputs_dir=str(out_dir),
+            stream=stream, outputs_dir=str(out_dir), time_budget_s=time_budget_s,
         )
         mcp.researchers[research_id] = researcher
 
