@@ -189,7 +189,7 @@ async def deep_tree_research(
     max_nodes: int = 40,
     token_budget: int = 300_000,
     credit_budget: float = 150,
-    novelty_threshold: float = 0.30,
+    novelty_threshold: float = 0.20,
     expansion_policy: str = "best_first",
     stream: bool = False,
     time_budget_s: float = 600,
@@ -208,7 +208,14 @@ async def deep_tree_research(
         max_nodes: Cap on researched nodes; leftover nodes stay pending (default 40)
         token_budget: Approximate total token budget (default 300000)
         credit_budget: Search/scrape credit budget (default 150)
-        novelty_threshold: Nodes with novelty below this are pruned, never expanded (default 0.30)
+        novelty_threshold: Nodes with novelty below this are pruned, never expanded (default
+            0.20, i.e. cosine similarity to already-covered ground must exceed 0.80 to prune).
+            Deliberately stricter than TreeResearchSkill.run's own 0.30 library default: a
+            root query that names several subtopics inflates cosine between the root and any
+            child drilling into one of them, so 0.30 (cosine > 0.70) pruned live children whose
+            content was genuinely new -- observed: a bun-rust-port child specifically about
+            what unsafe patterns adversarial reviewers caught was pruned and its findings
+            never reached the report, even though the root only mentioned reviewers in passing.
         expansion_policy: "best_first" (default), "bfs" or "dfs"
         stream: Reserved for streaming progress events (default False)
         time_budget_s: Wall-clock seconds for tree EXPANSION (default 600). Nodes are
