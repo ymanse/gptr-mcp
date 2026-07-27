@@ -219,11 +219,11 @@ async def deep_tree_research(
         expansion_policy: "best_first" (default), "bfs" or "dfs"
         stream: Reserved for streaming progress events (default False)
         time_budget_s: Wall-clock seconds for tree EXPANSION (default 600). Nodes are
-            researched sequentially at ~45s each, so this — not max_nodes — is what keeps
-            a run inside the caller's MCP idle timeout; leftover nodes stay pending and the
-            report is still synthesized. The sequential roll-up afterwards adds ~0.8x, so
-            total runtime is roughly 1.8 * this value (600 -> ~1080s, inside a 1200s idle
-            timeout). Raise it only alongside a raised client-side idle timeout.
+            researched in concurrent batches (node_concurrency, ~45s per node), so this —
+            not max_nodes — is what keeps a run inside the caller's MCP idle timeout;
+            leftover nodes stay pending and the report is still synthesized. The roll-up
+            afterwards is pure text assembly (no LLM), so total runtime tracks this value.
+            Raise it only alongside a raised client-side idle timeout.
 
     Returns:
         Dict with research status, stats, citation count and host paths of the persisted
