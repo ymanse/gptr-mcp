@@ -186,7 +186,7 @@ async def deep_tree_research(
     query: str,
     max_depth: int = 3,
     max_breadth: int = 4,
-    max_nodes: int = 40,
+    max_nodes: int = 20,
     token_budget: int = 300_000,
     credit_budget: float = 150,
     novelty_threshold: float = 0.20,
@@ -205,7 +205,12 @@ async def deep_tree_research(
         query: The root research question
         max_depth: Maximum tree depth below the root (default 3)
         max_breadth: Maximum children accepted per node (default 4)
-        max_nodes: Cap on researched nodes; leftover nodes stay pending (default 40)
+        max_nodes: Cap on researched nodes; leftover nodes stay pending (default 20).
+            Lowered from 40 on 2026-07-28: benchmark runs were reaching 24-30 researched
+            nodes, and each node costs a search plus its scrapes (~5,800 Firecrawl credits
+            per 5-query benchmark round). 20 keeps the measured S4/S5 headroom while
+            cutting roughly a third of the retrieval spend. Raise it per-call for a
+            deliberately exhaustive run.
         token_budget: Approximate total token budget (default 300000)
         credit_budget: Search/scrape credit budget (default 150)
         novelty_threshold: Nodes with novelty below this are pruned, never expanded (default
