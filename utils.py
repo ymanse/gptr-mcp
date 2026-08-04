@@ -210,6 +210,82 @@ def _slugify(text: str, max_len: int = 40) -> str:
     return slug[:max_len].strip("-") or "research"
 
 
+SNIPPET_CHARS = int(os.getenv("GPTR_MCP_SNIPPET_CHARS", "600") or 600)
+
+
+def persist_search_results(
+    query: str,
+    search_results: Any,
+    search_id: str,
+) -> Dict[str, Any]:
+    """Write full search results to disk; return snippets + the path.
+
+    Same artifact pattern as persist_research_artifacts, for the same reason. A
+    "quick" search is documented to return SNIPPETS, but the retrievers it fans out
+    over do not agree on what a result is: engine retrievers return 170-280 character
+    snippets while firecrawl returns the whole scraped page. Measured 2026-08-03 on a
+    9-result search — 5 real snippets and 4 full pages (5,177 / 7,740 / 13,996 /
+    20,757 chars), 48,771 characters of body that JSON escaping turned into 100,159.
+    That exceeds the MCP client's output ceiling, so the ENTIRE result was spilled to
+    a file the caller then had to read back in chunks; in practice it does not get
+    read, and a research run silently proceeds on whatever the first chunk held.
+
+    Bounding it here rather than at the client is the difference between paying for
+    what you use and paying 100 KB to learn nine page titles. Nothing is lost: the
+    untruncated bodies are on disk, and every truncated result says so and carries
+    its href.
+
+    600 chars is derived, not picked: it clears the longest engine snippet measured
+    (284), so no real snippet is ever cut, and a scraped page still shows its opening.
+    """
+    out_dir = get_output_dir()
+    stem = f"{_slugify(query)}-{search_id[:8]}"
+    results = list(search_results or [])
+
+    name = f"{stem}.search.json"
+    (out_dir / name).write_text(
+        json.dumps({"query": query, "search_id": search_id, "results": results},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    snippets, truncated, body_chars = [], 0, 0
+    for r in results:
+        if not isinstance(r, dict):
+            snippets.append({"body": str(r)[:SNIPPET_CHARS]})
+            continue
+        body = str(r.get("body") or r.get("content") or "")
+        body_chars += len(body)
+        row = {k: r.get(k) for k in ("title", "href", "url") if r.get(k)}
+        row["body"] = body[:SNIPPET_CHARS]
+        if len(body) > SNIPPET_CHARS:
+            # per-result, not just in the summary: an agent reading one row has to be
+            # able to see that this row is partial without correlating a global count
+            row["body_truncated"] = True
+            row["body_chars"] = len(body)
+            truncated += 1
+        snippets.append(row)
+
+    meta: Dict[str, Any] = {
+        "result_count": len(results),
+        "search_results": snippets,
+        "results_path": _to_host_path(name, out_dir),
+        "body_chars_total": body_chars,
+        "snippet_chars": SNIPPET_CHARS,
+        "truncated_results": truncated,
+    }
+    # Escape hatch, mirroring GPTR_MCP_INLINE_CONTEXT: restore the old full-body reply.
+    if os.getenv("GPTR_MCP_INLINE_SEARCH", "false").strip().lower() in ("1", "true", "yes"):
+        meta["search_results"] = results
+        meta["truncated_results"] = 0
+
+    logger.info(
+        f"Persisted search results: {name} ({len(results)} results, "
+        f"{body_chars} body chars, {truncated} truncated inline)"
+    )
+    return meta
+
+
 def build_report_markdown(
     query: str,
     context: str,

@@ -29,6 +29,7 @@ from utils import (
     create_research_prompt,
     normalize_context,
     persist_research_artifacts,
+    persist_search_results,
 )
 from verification import verify_research
 
@@ -274,12 +275,18 @@ async def quick_search(query: str) -> Dict[str, Any]:
     Perform a quick web search on a given query and return search results with snippets.
     This optimizes for speed over quality and is useful when an LLM doesn't need in-depth
     information on a topic.
-    
+
+    Bodies are snippets (see snippet_chars); any result whose body was cut is flagged
+    with body_truncated and its full length. The COMPLETE, untruncated results are
+    written to results_path — open that file when a snippet is not enough, rather than
+    re-running the search.
+
     Args:
         query: The search query
-        
+
     Returns:
-        Dict containing search results and snippets
+        Dict with search_results (snippets), results_path (full results on disk),
+        result_count, truncated_results and body_chars_total
     """
     logger.info(f"Performing quick search on query: {query}...")
     
@@ -295,11 +302,15 @@ async def quick_search(query: str) -> Dict[str, Any]:
         mcp.researchers[search_id] = researcher
         logger.info(f"Quick search completed for ID: {search_id}")
         
+        # Artifact pattern, as in write_report: full results to disk, snippets inline.
+        # Returning them raw exceeded the MCP client's output ceiling (measured: 9
+        # results -> 100,159 chars), which spills the WHOLE reply to a file the caller
+        # then has to read back — and a research run that does not read it proceeds on
+        # a fraction of what it asked for, silently.
         return create_success_response({
             "search_id": search_id,
             "query": query,
-            "result_count": len(search_results) if search_results else 0,
-            "search_results": search_results
+            **persist_search_results(query, search_results, search_id),
         })
     except Exception as e:
         return handle_exception(e, "Quick search")
