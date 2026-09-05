@@ -33,6 +33,24 @@ from utils import (
 )
 from verification import verify_research
 
+# Per-run cap on `claude` CLI sessions. With FAST/SMART/STRATEGIC on claude_agent every
+# LLM call spawns a CLI subprocess that registers as its own Claude Code session, so a
+# single tool call could run into the hundreds (measured 2026-08-05: 42 sessions in one
+# 10-minute research round). Each tool arms the budget on entry — that call IS the "run".
+# Guarded: on the OpenRouter rollback path the provider module need not be importable,
+# and a research server that will not start is worse than an unbounded one.
+try:
+    from gpt_researcher.llm_provider.claude_agent._subscription import (
+        agent_calls_spent,
+        begin_agent_run,
+    )
+except ImportError:  # pragma: no cover - rollback path
+    def begin_agent_run(limit=None) -> int:
+        return 0
+
+    def agent_calls_spent() -> int:
+        return 0
+
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s][%(levelname)s] - %(message)s',
@@ -112,6 +130,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         that can be used directly by LLMs for context enrichment
     """
     logger.info(f"Conducting research on query: {query} (retriever={retriever}, multi_llm_review={multi_llm_review})...")
+    begin_agent_run()
 
     # Save and set environment variables (GPTResearcher reads config from env,
     # NOT as constructor kwargs — passing them as kwargs leaks into LLM API calls)
@@ -176,6 +195,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             "sources": format_sources_for_response(sources),
             "source_urls": source_urls,
             "verification": verification,
+            "agent_calls": agent_calls_spent(),
             **artifacts,
         })
     except Exception as e:
@@ -239,6 +259,9 @@ async def deep_tree_research(
     from utils import get_output_dir, _to_host_path
 
     logger.info(f"Starting deep_tree_research on: {query} (max_depth={max_depth}, max_nodes={max_nodes})")
+    # The tree checks this budget between node batches, so a spent allowance stops
+    # expansion and still synthesizes — see stats.agent_calls_spent in the result.
+    begin_agent_run()
     research_id = str(uuid.uuid4())
     researcher = GPTResearcher(query)
     skill = TreeResearchSkill(researcher)
@@ -289,7 +312,8 @@ async def quick_search(query: str) -> Dict[str, Any]:
         result_count, truncated_results and body_chars_total
     """
     logger.info(f"Performing quick search on query: {query}...")
-    
+    begin_agent_run()
+
     # Generate a unique ID for this search session
     search_id = str(uuid.uuid4())
     
@@ -310,6 +334,7 @@ async def quick_search(query: str) -> Dict[str, Any]:
         return create_success_response({
             "search_id": search_id,
             "query": query,
+            "agent_calls": agent_calls_spent(),
             **persist_search_results(query, search_results, search_id),
         })
     except Exception as e:
@@ -333,7 +358,8 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
         return error
     
     logger.info(f"Generating report for research ID: {research_id}")
-    
+    begin_agent_run()
+
     try:
         # Generate report
         report = await researcher.write_report(custom_prompt=custom_prompt)
@@ -355,6 +381,7 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
             "research_id": research_id,
             "source_count": len(sources),
             "costs": costs,
+            "agent_calls": agent_calls_spent(),
             **artifacts,
         })
     except Exception as e:
