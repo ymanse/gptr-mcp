@@ -41,7 +41,9 @@ from verification import verify_research
 # and a research server that will not start is worse than an unbounded one.
 try:
     from gpt_researcher.llm_provider.claude_agent._subscription import (
+        agent_calls_by_site,
         agent_calls_spent,
+        agent_calls_this_run,
         begin_agent_run,
     )
 except ImportError:  # pragma: no cover - rollback path
@@ -50,6 +52,12 @@ except ImportError:  # pragma: no cover - rollback path
 
     def agent_calls_spent() -> int:
         return 0
+
+    def agent_calls_this_run() -> int:
+        return 0
+
+    def agent_calls_by_site() -> dict:
+        return {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -195,7 +203,11 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             "sources": format_sources_for_response(sources),
             "source_urls": source_urls,
             "verification": verification,
+            # agent_calls is the pooled process total; these two are what THIS
+            # call spent and which of the seven sites spent it.
             "agent_calls": agent_calls_spent(),
+            "agent_calls_this_run": agent_calls_this_run(),
+            "agent_calls_by_site": agent_calls_by_site(),
             **artifacts,
         })
     except Exception as e:
@@ -334,7 +346,11 @@ async def quick_search(query: str) -> Dict[str, Any]:
         return create_success_response({
             "search_id": search_id,
             "query": query,
+            # agent_calls is the pooled process total; these two are what THIS
+            # call spent and which of the seven sites spent it.
             "agent_calls": agent_calls_spent(),
+            "agent_calls_this_run": agent_calls_this_run(),
+            "agent_calls_by_site": agent_calls_by_site(),
             **persist_search_results(query, search_results, search_id),
         })
     except Exception as e:
@@ -381,7 +397,11 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
             "research_id": research_id,
             "source_count": len(sources),
             "costs": costs,
+            # agent_calls is the pooled process total; these two are what THIS
+            # call spent and which of the seven sites spent it.
             "agent_calls": agent_calls_spent(),
+            "agent_calls_this_run": agent_calls_this_run(),
+            "agent_calls_by_site": agent_calls_by_site(),
             **artifacts,
         })
     except Exception as e:

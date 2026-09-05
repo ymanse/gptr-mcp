@@ -178,3 +178,6 @@ outputs/
 
 # OMC local orchestration state
 .omc/
+
+# per-session agent state (kg edit queues) — never commit
+.claude/state/

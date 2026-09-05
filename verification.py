@@ -151,23 +151,32 @@ async def audit_faithfulness(researcher, query, context, sources):
     SMART LLM (their claude_agent subscription -> no extra metered API cost)."""
     from gpt_researcher.utils.llm import create_chat_completion
 
+    try:
+        from gpt_researcher.utils.agent_purpose import agent_purpose
+    except ImportError:  # pragma: no cover - a fork without the attribution
+        from contextlib import nullcontext
+
+        def agent_purpose(_site):
+            return nullcontext()
+
     ctx = context if isinstance(context, str) else str(context)
     ctx = ctx[:12000]  # ponytail: bound the evidence fed into one call
     user = (
         f"QUERY:\n{query}\n\nCONTEXT (evidence):\n{ctx}\n\n"
         f"SOURCES:\n{json.dumps(_compact_sources(sources), ensure_ascii=False)}"
     )
-    resp = await create_chat_completion(
-        model=researcher.cfg.smart_llm_model,
-        messages=[
-            {"role": "system", "content": _VERIFY_SYSTEM},
-            {"role": "user", "content": user},
-        ],
-        temperature=0.1,
-        llm_provider=researcher.cfg.smart_llm_provider,
-        max_tokens=2000,
-        llm_kwargs=researcher.cfg.llm_kwargs,
-    )
+    with agent_purpose("verify"):
+        resp = await create_chat_completion(
+            model=researcher.cfg.smart_llm_model,
+            messages=[
+                {"role": "system", "content": _VERIFY_SYSTEM},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.1,
+            llm_provider=researcher.cfg.smart_llm_provider,
+            max_tokens=2000,
+            llm_kwargs=researcher.cfg.llm_kwargs,
+        )
     parsed = _parse_json(resp)
     # A dict that carries none of the audit's keys is not an audit either. Rejecting
     # only non-dicts would still let `{"error": "..."}` or `{}` through, and both then
