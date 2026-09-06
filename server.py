@@ -31,6 +31,7 @@ from utils import (
     persist_research_artifacts,
     persist_search_results,
 )
+from tiers import DEFAULT_TIER, TIERS, resolve as resolve_tier
 from verification import verify_research
 
 # Per-run cap on `claude` CLI sessions. With FAST/SMART/STRATEGIC on claude_agent every
@@ -120,6 +121,20 @@ async def research_resource(topic: str) -> str:
         return f"Error conducting research on '{topic}': {str(e)}"
 
 
+# The tree tool's parameter defaults predate tiers, so a caller who says nothing is
+# indistinguishable from one who restates the old default. Comparing against those
+# defaults is how the tier gets to fill in the rest without overriding a real choice.
+_TREE_ARG_DEFAULTS = {"max_depth": 3, "max_breadth": 4, "max_nodes": 20,
+                      "time_budget_s": 600}
+
+
+def _explicit_tree_args(max_depth, max_breadth, max_nodes, time_budget_s) -> dict:
+    """Only the tree arguments whose value differs from the pre-tier default."""
+    given = {"max_depth": max_depth, "max_breadth": max_breadth,
+             "max_nodes": max_nodes, "time_budget_s": time_budget_s}
+    return {k: v for k, v in given.items() if v != _TREE_ARG_DEFAULTS[k]}
+
+
 @mcp.tool()
 async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False, scope: bool = False) -> Dict[str, Any]:
     """
@@ -138,7 +153,10 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         that can be used directly by LLMs for context enrichment
     """
     logger.info(f"Conducting research on query: {query} (retriever={retriever}, multi_llm_review={multi_llm_review})...")
-    begin_agent_run()
+    # A linear deep run measured 43 CLI sessions (2026-09-02, two runs in one
+    # window). Asking for the "deep" tier rather than the env default of 100 is what
+    # stops concurrent calls starving each other out of one pooled ceiling.
+    begin_agent_run(TIERS["deep"]["max_calls"])
 
     # Save and set environment variables (GPTResearcher reads config from env,
     # NOT as constructor kwargs — passing them as kwargs leaks into LLM API calls)
@@ -226,6 +244,7 @@ async def deep_tree_research(
     expansion_policy: str = "best_first",
     stream: bool = False,
     time_budget_s: float = 600,
+    depth: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Conduct tree-structured deep research: the answer to each research question spawns
@@ -262,6 +281,14 @@ async def deep_tree_research(
             leftover nodes stay pending and the report is still synthesized. The roll-up
             afterwards is pure text assembly (no LLM), so total runtime tracks this value.
             Raise it only alongside a raised client-side idle timeout.
+        depth: "light" | "standard" | "deep". Sets max_nodes/max_depth/max_breadth,
+            time_budget_s, node_concurrency AND — the part that matters — how large an
+            allowance of `claude` CLI sessions this call asks for. Allowances POOL across
+            concurrent calls, so a call that asks for more than it needs starves its
+            siblings: measured 2026-09-02, seven runs armed within twelve minutes shared
+            one ceiling of 171 and each researched a SINGLE node of the twenty it wanted.
+            Any explicit parameter above overrides the tier's value for that parameter.
+            Omitted, the tier's own defaults apply and the tier is "standard".
 
     Returns:
         Dict with research status, stats, citation count and host paths of the persisted
@@ -270,10 +297,22 @@ async def deep_tree_research(
     from gpt_researcher.skills.tree_research import TreeResearchSkill
     from utils import get_output_dir, _to_host_path
 
-    logger.info(f"Starting deep_tree_research on: {query} (max_depth={max_depth}, max_nodes={max_nodes})")
+    # A tier is a REQUEST for an allowance, sized from what that depth measurably costs.
+    # Explicit arguments still win: the tier fills in what the caller did not state, so a
+    # caller who names max_nodes gets exactly that, with a budget scaled to the tier.
+    tier_name, preset = resolve_tier(depth)
+    explicit = _explicit_tree_args(max_depth, max_breadth, max_nodes, time_budget_s)
+    max_depth = explicit.get("max_depth", preset["max_depth"])
+    max_breadth = explicit.get("max_breadth", preset["max_breadth"])
+    max_nodes = explicit.get("max_nodes", preset["max_nodes"])
+    time_budget_s = explicit.get("time_budget_s", preset["time_budget_s"])
+
+    logger.info(f"Starting deep_tree_research on: {query} "
+                f"(tier={tier_name}, max_depth={max_depth}, max_nodes={max_nodes}, "
+                f"allowance={preset['max_calls']})")
     # The tree checks this budget between node batches, so a spent allowance stops
     # expansion and still synthesizes — see stats.agent_calls_spent in the result.
-    begin_agent_run()
+    begin_agent_run(preset["max_calls"])
     research_id = str(uuid.uuid4())
     researcher = GPTResearcher(query)
     skill = TreeResearchSkill(researcher)
@@ -283,6 +322,7 @@ async def deep_tree_research(
         result = await skill.run(
             query=query, max_depth=max_depth, max_breadth=max_breadth,
             max_nodes=max_nodes, token_budget=token_budget, credit_budget=credit_budget,
+            node_concurrency=preset["node_concurrency"],
             novelty_threshold=novelty_threshold, expansion_policy=expansion_policy,
             stream=stream, outputs_dir=str(out_dir), time_budget_s=time_budget_s,
         )
@@ -295,6 +335,7 @@ async def deep_tree_research(
         return create_success_response({
             "research_id": research_id,
             "query": query,
+            "tier": tier_name,
             "stats": result["stats"],
             "citation_count": len(result.get("citation_map", {})),
             "tree_json_path": _to_host_path(tree_name, out_dir) if tree_name else None,
@@ -324,7 +365,7 @@ async def quick_search(query: str) -> Dict[str, Any]:
         result_count, truncated_results and body_chars_total
     """
     logger.info(f"Performing quick search on query: {query}...")
-    begin_agent_run()
+    begin_agent_run(TIERS["light"]["max_calls"])  # measured: 1 session
 
     # Generate a unique ID for this search session
     search_id = str(uuid.uuid4())
@@ -374,7 +415,7 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
         return error
     
     logger.info(f"Generating report for research ID: {research_id}")
-    begin_agent_run()
+    begin_agent_run(TIERS["standard"]["max_calls"])
 
     try:
         # Generate report
