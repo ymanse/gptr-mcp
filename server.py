@@ -34,6 +34,26 @@ from utils import (
 from tiers import DEFAULT_TIER, TIERS, resolve as resolve_tier
 from verification import verify_research
 
+
+def _with_refusal(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Attach the provider's own words when it refused.
+
+    Two very different failures render as the same "Failed to get response from
+    claude_agent API": this run spending its allowance, and the ACCOUNT hitting its
+    session limit. On 2026-09-10 that ambiguity sent a debugging session into the code
+    before anyone opened the container log, where the CLI had said plainly:
+    "You've hit your session limit · resets 5:50am (UTC)". Say it here instead.
+    """
+    refused, reason = provider_refused()
+    if refused:
+        result["provider_refused"] = True
+        result["provider_refusal_reason"] = reason
+        result["hint"] = (
+            "This is the Claude subscription's own limit, not a bug in the research "
+            "server and not this call's budget: " + reason
+        )
+    return result
+
 # Per-run cap on `claude` CLI sessions. With FAST/SMART/STRATEGIC on claude_agent every
 # LLM call spawns a CLI subprocess that registers as its own Claude Code session, so a
 # single tool call could run into the hundreds (measured 2026-08-05: 42 sessions in one
@@ -46,6 +66,7 @@ try:
         agent_calls_spent,
         agent_calls_this_run,
         begin_agent_run,
+        provider_refused,
     )
 except ImportError:  # pragma: no cover - rollback path
     def begin_agent_run(limit=None) -> int:
@@ -59,6 +80,9 @@ except ImportError:  # pragma: no cover - rollback path
 
     def agent_calls_by_site() -> dict:
         return {}
+
+    def provider_refused() -> tuple:
+        return False, ""
 
 logging.basicConfig(
     level=logging.INFO,
@@ -229,7 +253,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             **artifacts,
         })
     except Exception as e:
-        return handle_exception(e, "Research")
+        return _with_refusal(handle_exception(e, "Research"))
 
 
 @mcp.tool()
@@ -342,7 +366,7 @@ async def deep_tree_research(
             "report_path": _to_host_path(report_name, out_dir) if report_name else None,
         })
     except Exception as e:
-        return handle_exception(e, "Tree research")
+        return _with_refusal(handle_exception(e, "Tree research"))
 
 
 @mcp.tool()
@@ -395,7 +419,7 @@ async def quick_search(query: str) -> Dict[str, Any]:
             **persist_search_results(query, search_results, search_id),
         })
     except Exception as e:
-        return handle_exception(e, "Quick search")
+        return _with_refusal(handle_exception(e, "Quick search"))
 
 
 @mcp.tool()
@@ -446,7 +470,7 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
             **artifacts,
         })
     except Exception as e:
-        return handle_exception(e, "Report generation")
+        return _with_refusal(handle_exception(e, "Report generation"))
 
 
 @mcp.tool()
