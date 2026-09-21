@@ -29,6 +29,7 @@ from utils import (
     create_research_prompt,
     normalize_context,
     persist_research_artifacts,
+    build_report_markdown,
     persist_search_results,
 )
 from tiers import DEFAULT_TIER, TIERS, resolve as resolve_tier
@@ -159,6 +160,31 @@ def _explicit_tree_args(max_depth, max_breadth, max_nodes, time_budget_s) -> dic
     return {k: v for k, v in given.items() if v != _TREE_ARG_DEFAULTS[k]}
 
 
+def _partial_banner(researcher) -> str:
+    """A disclosure at the TOP of a report whose research was cut short, or "".
+
+    Deterministic on purpose. The research context already ends in an "Incomplete
+    Research" notice, and the report is written from that context -- but measured
+    2026-09-21, a report written from a time-truncated 25k-word context never mentioned
+    it: the notice sat at the end of the input and the writer did not relay it. A
+    partial report that reads as complete is the failure the notice exists to prevent,
+    so it is stated here, where no model can drop it.
+    """
+    skill = getattr(researcher, "deep_researcher", None)
+    reasons = []
+    if getattr(skill, "time_exhausted", False):
+        reasons.append("its time budget ran out")
+    if getattr(skill, "budget_exhausted", False):
+        reasons.append("its LLM call budget ran out")
+    if not reasons:
+        return ""
+    return ("> **Partial research.** This research stopped early because "
+            + " and ".join(reasons)
+            + ", before every planned question was investigated. The report below is "
+              "written only from what was gathered: a topic it does not cover was not "
+              "examined, which is not evidence that it does not matter.\n\n")
+
+
 @mcp.tool()
 async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False, scope: bool = False, time_budget_s: Optional[float] = None) -> Dict[str, Any]:
     """
@@ -240,14 +266,42 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             except Exception as e:
                 logger.warning(f"Verification pass failed: {e}")
 
+        # ALWAYS synthesize -- a time-truncated run above all. Measured 2026-09-21: a
+        # run that spent its 600s budget came back as a 284KB context dump with no
+        # report, because synthesis lived only in the separate write_report tool: a
+        # second round trip the caller had to remember, keyed on an in-memory
+        # researcher that a container restart loses. The research budget bounds
+        # EXPLORATION; this runs after it, so a cut-short run still ends in a report
+        # -- and the context it is written from carries the "Incomplete Research"
+        # notice, so the report says it is partial rather than passing as complete.
+        #
+        # A synthesis failure must never cost the research: the context is still
+        # persisted and returned below, and the failure is named in the response.
+        # write_report stays available to re-synthesize with a custom prompt.
+        report, report_error = None, None
+        try:
+            report = await researcher.write_report()
+        except Exception as e:
+            report_error = f"{type(e).__name__}: {e}"
+            logger.warning(f"Synthesis failed, returning the research without a report: "
+                           f"{report_error}")
+
         # Store in the research store for the resource API
         store_research_results(query, context, sources, source_urls)
 
         # Artifact pattern: write the full context + sources to disk and return only a
         # compact preview + file paths, so the (potentially 70KB+) context never gets
-        # dumped into the model context as a single-line JSON blob.
+        # dumped into the model context as a single-line JSON blob. With a report, it
+        # goes FIRST and the raw research follows it -- the preview is then the
+        # synthesis, and the evidence it was written from is still in the same file.
+        report_md = None
+        if report:
+            report_md = (_partial_banner(researcher) + f"{report}\n\n---\n\n"
+                         + build_report_markdown(query, context, sources, source_urls,
+                                                 research_id))
         artifacts = persist_research_artifacts(
-            query, context, sources, source_urls, research_id, verification=verification
+            query, context, sources, source_urls, research_id,
+            verification=verification, report_text=report_md,
         )
 
         return create_success_response({
@@ -266,6 +320,9 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             # caller reads a preview; this is where it can tell without opening it.
             "time_budget_exhausted": bool(getattr(researcher.deep_researcher,
                                                   "time_exhausted", False)),
+            # False means report_path holds the raw research only; report_error says why.
+            "report_written": bool(report),
+            "report_error": report_error,
             **artifacts,
         })
     except Exception as e:
