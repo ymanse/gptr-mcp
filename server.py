@@ -160,7 +160,7 @@ def _explicit_tree_args(max_depth, max_breadth, max_nodes, time_budget_s) -> dic
 
 
 @mcp.tool()
-async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False, scope: bool = False) -> Dict[str, Any]:
+async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False, scope: bool = False, time_budget_s: Optional[float] = None) -> Dict[str, Any]:
     """
     Conduct a web deep research on a given query using GPT Researcher.
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
@@ -171,6 +171,10 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         multi_llm_review: Enable multi-LLM consensus review (Gemini + ChatGPT + Claude review research for gaps and deeper exploration). Defaults to False.
         verify: Run a post-research verification pass — source tiering (L1-L4 credibility) + faithfulness audit (unsupported-claim + contradiction detection). Complements multi_llm_review (which fills gaps). Off by default; also enabled globally via GPTR_MCP_VERIFY=true.
         scope: Build a 1-round scope brief (clarification questions resolved into a scope statement) before researching, instead of auto-proceeding. Defaults to False.
+        time_budget_s: Wall-clock ceiling for the whole run, in seconds. Omit to use
+            DEEP_RESEARCH_TIME_BUDGET_S from the server .env (600). Exceeding it returns
+            a shallower report marked partial (time_budget_exhausted=true), not an
+            error. 0 = unbounded (the pre-2026-09-21 behaviour).
 
     Returns:
         Dict containing research status, ID, and the actual research context and sources
@@ -186,6 +190,13 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
     # NOT as constructor kwargs — passing them as kwargs leaks into LLM API calls)
     prev_retriever = os.environ.get("RETRIEVER")
     prev_multi_llm = os.environ.get("MULTI_LLM_REVIEW_ENABLED")
+    prev_time_budget = os.environ.get("DEEP_RESEARCH_TIME_BUDGET_S")
+    # DeepResearchSkill reads this off cfg at GPTResearcher construction, and Config
+    # takes it from the environment -- same reason RETRIEVER is set this way rather
+    # than passed as a kwarg. Only when the caller asked: otherwise the .env value
+    # stands, so the operator knob is not silently shadowed on every call.
+    if time_budget_s is not None:
+        os.environ["DEEP_RESEARCH_TIME_BUDGET_S"] = str(float(time_budget_s))
 
     if multi_llm_review:
         os.environ["MULTI_LLM_REVIEW_ENABLED"] = "true"
@@ -201,7 +212,8 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
     researcher = GPTResearcher(query, report_type="deep")
 
     # Restore previous env vars to avoid side effects between calls
-    for key, prev_val in [("RETRIEVER", prev_retriever), ("MULTI_LLM_REVIEW_ENABLED", prev_multi_llm)]:
+    for key, prev_val in [("RETRIEVER", prev_retriever), ("MULTI_LLM_REVIEW_ENABLED", prev_multi_llm),
+                          ("DEEP_RESEARCH_TIME_BUDGET_S", prev_time_budget)]:
         if prev_val is not None:
             os.environ[key] = prev_val
         elif key in os.environ:
@@ -250,6 +262,10 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             "agent_calls": agent_calls_spent(),
             "agent_calls_this_run": agent_calls_this_run(),
             "agent_calls_by_site": agent_calls_by_site(),
+            # The context carries the "Incomplete Research" notice too, but the
+            # caller reads a preview; this is where it can tell without opening it.
+            "time_budget_exhausted": bool(getattr(researcher.deep_researcher,
+                                                  "time_exhausted", False)),
             **artifacts,
         })
     except Exception as e:
