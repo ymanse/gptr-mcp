@@ -26,7 +26,11 @@ import server  # noqa: E402
 
 QUERY = "What bounds outbox table growth?"
 NOTICE = "## Incomplete Research\nThis research stopped early: the run's time budget ran out"
-CONTEXT = "Teams partition the outbox by day and drop old partitions.\n\n" + NOTICE
+# Long enough to clear MIN_RESEARCH_CONTEXT_CHARS: these tests are about what happens to
+# a run that DID gather evidence, and a fixture under the floor would make every one of
+# them exercise the nothing-gathered path instead.
+CONTEXT = ("Teams partition the outbox by day and drop old partitions. " * 30
+           + "\n\n" + NOTICE)
 REPORT = "# Outbox growth\n\nTeams partition by day. This report is PARTIAL: the time budget ran out."
 
 
@@ -204,3 +208,34 @@ def test_a_run_that_gathered_nothing_writes_no_report_and_says_so(monkeypatch, t
     message = out.get("message", "")
     assert "NO evidence" in message and "time budget" in message, (
         f"the failure does not say what happened or what to change: {message!r}")
+
+
+def test_a_context_too_small_to_be_research_is_treated_as_nothing(monkeypatch, tmp_path):
+    """Emptiness was too literal a bar. Measured 2026-09-21: a run whose every
+    compression raised (a wrapper that EmbeddingsFilter rejected) returned 225
+    characters across 128 sources and reported success, with a report written from it.
+    The sources are no evidence that the research survived."""
+    CRUMBS = "[]\n" * 60      # ~180 chars of nothing, what the broken run returned
+
+    class _Crumbs(_Stub):
+        # Not truncated: the measured run reported time_budget_exhausted=false. The
+        # budget was fine, the compressions were not -- which is the case the generic
+        # reason exists for.
+        TRUNCATED = False
+
+        async def conduct_research(self, scope=False):
+            return CRUMBS
+
+        def get_research_context(self):
+            return CRUMBS
+
+        async def write_report(self, custom_prompt=None):
+            raise AssertionError("the report writer must not be reached")
+
+    out = _run(monkeypatch, tmp_path, _Crumbs)
+
+    assert out.get("status") == "error", (
+        f"a run with a {len(CRUMBS)}-char context reported {out.get('status')!r} -- "
+        "every sub-query failed and the caller is told it succeeded")
+    assert out.get("report_written") is False
+    assert "NO usable evidence" in out.get("message", "")

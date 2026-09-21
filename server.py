@@ -161,6 +161,16 @@ def _explicit_tree_args(max_depth, max_breadth, max_nodes, time_budget_s) -> dic
     return {k: v for k, v in given.items() if v != _TREE_ARG_DEFAULTS[k]}
 
 
+# Below this many characters a deep_research context is not research, whatever the
+# source count says. Empty was the original bar and it was too literal: measured
+# 2026-09-21, a run whose every compression failed returned 225 characters (a handful of
+# empty per-sub-query entries) with 128 sources, and sailed through as success with a
+# report written from it. Deliberately far below a real run -- the smallest healthy
+# context measured on this deployment is ~34,000 characters -- so this fires on broken,
+# never on brief.
+MIN_RESEARCH_CONTEXT_CHARS = 1000
+
+
 def _nothing_gathered_reason(researcher) -> str:
     """Why a deep_research run came back with no evidence, in words a caller can act on."""
     skill = getattr(researcher, "deep_researcher", None)
@@ -173,8 +183,9 @@ def _nothing_gathered_reason(researcher) -> str:
     if getattr(skill, "budget_exhausted", False):
         return ("Research gathered NO evidence: the LLM call budget was spent before any "
                 "sub-query finished, so no report was written.")
-    return ("Research gathered NO evidence: every sub-query failed, so no report was "
-            "written. See the server log for the per-sub-query errors.")
+    return ("Research gathered NO usable evidence: every sub-query returned an empty or "
+            "near-empty context, so no report was written. See the server log for the "
+            "per-sub-query errors (a compression or embedding failure looks like this).")
 
 
 def _partial_banner(researcher) -> str:
@@ -283,7 +294,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         # handed to the report writer is worse than an exception. So: no verification,
         # no report, status error, and the reason named -- a caller reading "success"
         # does not go on to check source_count.
-        if not context.strip():
+        if len(context.strip()) < MIN_RESEARCH_CONTEXT_CHARS:
             return _with_refusal({
                 **create_error_response(_nothing_gathered_reason(researcher)),
                 "research_id": research_id,
