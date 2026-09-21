@@ -38,7 +38,8 @@ class _Stub:
     def __init__(self, query, report_type=None, **kwargs):
         self.query = query
         self.deep_researcher = type("DR", (), {"time_exhausted": self.TRUNCATED,
-                                               "budget_exhausted": False})()
+                                               "budget_exhausted": False,
+                                               "time_budget_s": 600.0})()
         self.report_calls = 0
 
     async def conduct_research(self, scope=False):
@@ -164,3 +165,42 @@ def test_a_failed_synthesis_never_costs_the_research(monkeypatch, tmp_path):
         f"the response does not say why there is no report: {out.get('report_error')!r}")
     assert "partition the outbox by day" in _artifact(out, tmp_path), (
         "the research was not persisted after the synthesis failed")
+
+
+def test_a_run_that_gathered_nothing_writes_no_report_and_says_so(monkeypatch, tmp_path):
+    """Measured 2026-09-21, live: a slow academic query's first round did not finish in
+    600s, the run gathered 0 sources and an empty context, and the synthesis step wrote
+    20KB from the model's prior knowledge anyway -- status "success", under a banner
+    claiming it was "written only from what was gathered". A report from nothing is the
+    fabrication this pipeline exists to prevent; with nothing gathered the call fails."""
+    calls = {"report": 0}
+
+    class _Empty(_Stub):
+        async def conduct_research(self, scope=False):
+            return ""
+
+        def get_research_context(self):
+            return ""
+
+        def get_research_sources(self):
+            return []
+
+        def get_source_urls(self):
+            return []
+
+        async def write_report(self, custom_prompt=None):
+            calls["report"] += 1
+            return "# A report written from prior knowledge"
+
+    out = _run(monkeypatch, tmp_path, _Empty)
+
+    assert calls["report"] == 0, (
+        "the report writer was called with an empty context -- whatever it returns can "
+        "only come from the model's prior knowledge")
+    assert out.get("status") == "error", (
+        f"a run that gathered nothing reported status {out.get('status')!r}; a caller "
+        "reading success does not go on to check source_count")
+    assert out.get("report_written") is False
+    message = out.get("message", "")
+    assert "NO evidence" in message and "time budget" in message, (
+        f"the failure does not say what happened or what to change: {message!r}")

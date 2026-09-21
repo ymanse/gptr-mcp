@@ -21,6 +21,7 @@ load_dotenv()
 from utils import (
     research_store,
     create_success_response,
+    create_error_response,
     handle_exception,
     get_researcher_by_id,
     format_sources_for_response,
@@ -160,6 +161,22 @@ def _explicit_tree_args(max_depth, max_breadth, max_nodes, time_budget_s) -> dic
     return {k: v for k, v in given.items() if v != _TREE_ARG_DEFAULTS[k]}
 
 
+def _nothing_gathered_reason(researcher) -> str:
+    """Why a deep_research run came back with no evidence, in words a caller can act on."""
+    skill = getattr(researcher, "deep_researcher", None)
+    if getattr(skill, "time_exhausted", False):
+        budget = getattr(skill, "time_budget_s", 0) or 0
+        return (f"Research gathered NO evidence: the {budget:.0f}s time budget ran out before "
+                "any first-round sub-query finished, so no report was written (one written "
+                "now would come from the model's prior knowledge, not from sources). Raise "
+                "time_budget_s (DEEP_RESEARCH_TIME_BUDGET_S) or narrow the query.")
+    if getattr(skill, "budget_exhausted", False):
+        return ("Research gathered NO evidence: the LLM call budget was spent before any "
+                "sub-query finished, so no report was written.")
+    return ("Research gathered NO evidence: every sub-query failed, so no report was "
+            "written. See the server log for the per-sub-query errors.")
+
+
 def _partial_banner(researcher) -> str:
     """A disclosure at the TOP of a report whose research was cut short, or "".
 
@@ -256,6 +273,27 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         context = normalize_context(researcher.get_research_context())
         sources = researcher.get_research_sources()
         source_urls = researcher.get_source_urls()
+
+        # NOTHING GATHERED IS A FAILURE, not a report. Measured 2026-09-21: a query whose
+        # first round did not finish inside the 600s budget came back with 0 sources and
+        # an empty context -- and the synthesis step below wrote 20KB from the model's
+        # prior knowledge anyway, under a banner saying "written only from what was
+        # gathered", with status success. That is the failure this codebase warns about
+        # everywhere (s11, _researched_any, BUDGET_TRUNCATION_NOTICE): an empty context
+        # handed to the report writer is worse than an exception. So: no verification,
+        # no report, status error, and the reason named -- a caller reading "success"
+        # does not go on to check source_count.
+        if not context.strip():
+            return _with_refusal({
+                **create_error_response(_nothing_gathered_reason(researcher)),
+                "research_id": research_id,
+                "source_count": 0,
+                "time_budget_exhausted": bool(getattr(researcher.deep_researcher,
+                                                      "time_exhausted", False)),
+                "report_written": False,
+                "agent_calls_this_run": agent_calls_this_run(),
+                "agent_calls_by_site": agent_calls_by_site(),
+            })
 
         # Optional post-research verification (source tiering + faithfulness audit).
         # Off by default; enable per-call (verify=true) or globally (GPTR_MCP_VERIFY=true).
