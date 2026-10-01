@@ -301,6 +301,16 @@ def build_report_markdown(
     lines.append(f"- sources: {len(sources or [])}")
     if costs is not None:
         lines.append(f"- costs: {costs}")
+    # The context goes in byte-for-byte. Do not "tidy" its scraped headings here. A demotion
+    # of ATX headings with a ``` fence tracker was tried (2026-10-01) and removed: a context
+    # is a run of arbitrary page slices, so a slice can start inside a code block whose
+    # opening fence was never scraped, and then the tracker has the fences inverted. On
+    # outputs/nautilustrader-built-in-reporting-and-an-a76fd491.md it rewrote Python comments
+    # ("# Write a list of data objects") as headings and skipped a real one ("### [Writing
+    # data]") as code. "# Write data" is the same bytes as a comment and as a heading, so no
+    # regex can tell them apart. The outline it was cleaning is gone from the report anyway
+    # (split=True). tests/test_report_evidence_split.py
+    # ::test_the_evidence_holds_the_context_byte_for_byte fails if this is reintroduced.
     lines.extend(["", "## Context", "", context if context else "_(empty)_", "", "## Sources", ""])
     if sources:
         for i, s in enumerate(sources, 1):
@@ -322,31 +332,71 @@ def persist_research_artifacts(
     report_text: Optional[str] = None,
     costs: Any = None,
     verification: Optional[Dict[str, Any]] = None,
+    split: bool = False,
 ) -> Dict[str, Any]:
     """
     Write the full research output to disk and return compact inline metadata.
 
     Files written (under get_output_dir(), stem = ``<slug>-<short_id>``):
-      - ``<stem>.md``           : Markdown report (context + sources)        [L2]
+      - ``<stem>.md``           : the thing to read first                  [L2]
+      - ``<stem>.context.md``   : the evidence -- context + sources        [L2, split only]
       - ``<stem>.sources.json`` : full sources incl. content, pretty JSON    [L3]
 
+    split=False (the default, and what every caller got before): ONE ``<stem>.md`` --
+    report_text verbatim when given, otherwise the context rendered by
+    build_report_markdown.
+
+    split=True: the evidence ALWAYS goes to ``<stem>.context.md``, and ``<stem>.md`` is
+    written only when there is a report_text to put in it (with a last line naming the
+    evidence file, so the link survives without the response). Why: deep_research used to
+    glue synthesis and evidence into one file, and a caller told to "read report_path"
+    reads all of it. Measured on empirical-evidence-on-llm-coding-agent-a-e59185e7
+    (2026-10-01): 72,436 chars, of which banner + synthesis + references were 19,142
+    (26.4%) and the evidence dump 53,423 (73.8%); 89-93% dump on the four larger reports
+    re-split the same way (233k-375k chars). A
+    separate stream measured the same summary from the synthesis alone at the same
+    essential recall (12/12, 14/14) for 60-85% less. With no report_text, ``<stem>.md`` is
+    left untouched -- get_research_context on a deep_research id used to overwrite the
+    synthesis there with the dump.
+
     Returned dict (merged into the tool's success response) contains only paths,
-    counts and a bounded preview — never the full body, unless GPTR_MCP_INLINE_CONTEXT
-    is truthy (escape hatch to restore the old inline behavior).
+    counts and a bounded preview -- never the full body, unless GPTR_MCP_INLINE_CONTEXT
+    is truthy (escape hatch to restore the old inline behavior):
+      - report_path  : read this first. The synthesis when there is one.
+      - context_path : the markdown holding the evidence. Equal to report_path when the
+                       two are one file (split=False with no report_text, or split=True
+                       with no report_text); None when this call wrote no evidence
+                       markdown (split=False with a report_text).
     """
     out_dir = get_output_dir()
     stem = f"{_slugify(query)}-{research_id[:8]}"
     context = normalize_context(context)
 
     report_name = f"{stem}.md"
+    context_name = f"{stem}.context.md"
     sources_name = f"{stem}.sources.json"
 
-    # L2: Markdown report. For write_report, report_text is already Markdown — use it verbatim.
-    report_md = report_text if report_text is not None else build_report_markdown(
-        query, context, sources, source_urls, research_id, costs=costs
-    )
-    report_path = out_dir / report_name
-    report_path.write_text(report_md, encoding="utf-8")
+    def evidence_md() -> str:
+        return build_report_markdown(query, context, sources, source_urls, research_id,
+                                     costs=costs)
+
+    if split:
+        (out_dir / context_name).write_text(evidence_md(), encoding="utf-8")
+        written_context = context_name
+        if report_text is not None:
+            (out_dir / report_name).write_text(
+                f"{report_text.rstrip()}\n\n---\n\n_The evidence this report was written "
+                f"from: `{context_name}`, in the same folder._\n",
+                encoding="utf-8")
+            written_report = report_name
+        else:
+            written_report = context_name
+    else:
+        # L2: one file. For write_report-style callers report_text is already Markdown.
+        report_md = report_text if report_text is not None else evidence_md()
+        (out_dir / report_name).write_text(report_md, encoding="utf-8")
+        written_report = report_name
+        written_context = report_name if report_text is None else None
 
     # L3: full sources (with raw content) as pretty, multi-line JSON.
     sources_path = out_dir / sources_name
@@ -367,7 +417,8 @@ def persist_research_artifacts(
 
     preview_source = report_text if report_text is not None else context
     meta: Dict[str, Any] = {
-        "report_path": _to_host_path(report_name, out_dir),
+        "report_path": _to_host_path(written_report, out_dir),
+        "context_path": _to_host_path(written_context, out_dir) if written_context else None,
         "sources_path": _to_host_path(sources_name, out_dir),
         "context_chars": len(context),
         "context_words": len(context.split()),
@@ -380,7 +431,9 @@ def persist_research_artifacts(
         meta["context"] = context
 
     logger.info(
-        f"Persisted research artifacts: {report_path.name} "
+        f"Persisted research artifacts: {written_report}"
+        + (f" + {written_context}" if written_context not in (None, written_report) else "")
+        + " "
         f"({len(context)} chars, {len(sources or [])} sources)"
     )
     return meta

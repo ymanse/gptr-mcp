@@ -9,7 +9,8 @@ So `deep_research` now writes the report itself, after the research budget:
 
   - a truncated run still gets one, written from a context that carries the
     "Incomplete Research" notice, so the report says it is partial;
-  - the report goes FIRST in the artifact and the raw research follows it;
+  - the report is what report_path opens to; the raw research is kept beside it, in
+    the file context_path names (test_report_evidence_split.py);
   - a synthesis failure never costs the research: the context is still persisted and
     returned, and the response names the failure.
 
@@ -91,7 +92,8 @@ def test_a_time_truncated_run_still_ends_in_a_report(monkeypatch, tmp_path):
 
 def test_the_report_comes_first_and_the_research_is_still_there(monkeypatch, tmp_path):
     """The preview a caller reads is the synthesis; the evidence it was written from
-    stays in the same file, below it."""
+    is kept, in its own file beside the report (2026-10-01: it used to follow the
+    report in the same file, and a caller reading report_path read 74-93% dump)."""
     out = _run(monkeypatch, tmp_path)
     body = _artifact(out, tmp_path)
 
@@ -100,9 +102,10 @@ def test_the_report_comes_first_and_the_research_is_still_there(monkeypatch, tmp
     assert "## Context" not in head, (
         "the raw research dump comes before the report -- the caller opens the file "
         "to the evidence, not the synthesis")
-    assert "partition the outbox by day" in tail, (
-        "the raw research is missing from the artifact once a report is written -- "
-        "the evidence behind the synthesis was thrown away")
+    evidence = (tmp_path / Path(out["context_path"]).name).read_text(encoding="utf-8")
+    assert "partition the outbox by day" in evidence, (
+        "the raw research is missing once a report is written -- the evidence behind "
+        "the synthesis was thrown away")
     assert REPORT.splitlines()[0] in out["context_preview"], (
         "the inline preview is not the synthesis, so a caller reading only the "
         "response still sees the dump")

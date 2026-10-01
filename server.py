@@ -30,7 +30,6 @@ from utils import (
     create_research_prompt,
     normalize_context,
     persist_research_artifacts,
-    build_report_markdown,
     persist_search_results,
 )
 from tiers import DEFAULT_TIER, TIERS, resolve as resolve_tier
@@ -340,17 +339,20 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
 
         # Artifact pattern: write the full context + sources to disk and return only a
         # compact preview + file paths, so the (potentially 70KB+) context never gets
-        # dumped into the model context as a single-line JSON blob. With a report, it
-        # goes FIRST and the raw research follows it -- the preview is then the
-        # synthesis, and the evidence it was written from is still in the same file.
-        report_md = None
-        if report:
-            report_md = (_partial_banner(researcher) + f"{report}\n\n---\n\n"
-                         + build_report_markdown(query, context, sources, source_urls,
-                                                 research_id))
+        # dumped into the model context as a single-line JSON blob.
+        #
+        # With a report, the report and the evidence are TWO files: report_path is the
+        # synthesis (banner first), context_path the research it was written from. They
+        # used to be one file, report then dump, and the caller is told to read
+        # report_path -- so it read the dump too. Measured 2026-10-01 on
+        # empirical-evidence-on-llm-coding-agent-a-e59185e7: of 72,436 chars, the report
+        # is 19,142 (26.4%) and the dump 53,453 (73.8%); 89-93% dump on the four larger
+        # reports checked. Without a report nothing is split: report_path
+        # is the dump, as before, because there is nothing else to put there.
+        report_md = (_partial_banner(researcher) + report) if report else None
         artifacts = persist_research_artifacts(
             query, context, sources, source_urls, research_id,
-            verification=verification, report_text=report_md,
+            verification=verification, report_text=report_md, split=bool(report_md),
         )
 
         return create_success_response({
@@ -369,7 +371,8 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             # caller reads a preview; this is where it can tell without opening it.
             "time_budget_exhausted": bool(getattr(researcher.deep_researcher,
                                                   "time_exhausted", False)),
-            # False means report_path holds the raw research only; report_error says why.
+            # False means report_path holds the raw research only (and context_path is
+            # the same file); report_error says why.
             "report_written": bool(report),
             "report_error": report_error,
             **artifacts,
@@ -574,10 +577,15 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
         query = getattr(researcher, "query", research_id)
 
         # Artifact pattern: the report (already Markdown) is written to disk verbatim;
-        # only a preview + paths are returned inline.
+        # only a preview + paths are returned inline. Split, as in deep_research: same
+        # stem, so this replaces deep_research's synthesis at report_path and rewrites the
+        # evidence file from the same researcher, rather than leaving the caller with a
+        # report and no pointer to what it was written from. context_chars is now the
+        # research context's size; it used to be the report's, passed in as `context`.
+        context = normalize_context(researcher.get_research_context())
         artifacts = persist_research_artifacts(
-            query, report, sources, source_urls, research_id,
-            report_text=report, costs=costs,
+            query, context, sources, source_urls, research_id,
+            report_text=report, costs=costs, split=True,
         )
 
         return create_success_response({
@@ -641,8 +649,11 @@ async def get_research_context(research_id: str) -> Dict[str, Any]:
 
     # Artifact pattern: persist the full context and return a preview + paths instead of
     # dumping the whole context inline. Set GPTR_MCP_INLINE_CONTEXT=true to get it inline.
+    # split=True writes the evidence file only (report_path and context_path both name
+    # it): this research_id's <stem>.md is deep_research's synthesis, and writing the
+    # context there, as this call used to, overwrote the report with the dump.
     artifacts = persist_research_artifacts(
-        query, context, sources, source_urls, research_id
+        query, context, sources, source_urls, research_id, split=True,
     )
 
     return create_success_response({
