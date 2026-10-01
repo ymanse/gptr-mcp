@@ -398,3 +398,330 @@ def test_one_non_probability_confidence_is_unjudged_not_verified(judge, llm_call
     assert [r["tentative"] for r in out["needs_review"]] == ["unjudged"]
     assert "27.67%" in out["needs_review"][0]["claim"]
     assert out["overall_confidence"] == round(5 / 6, 2)
+
+
+# ── s26: the audit checks the REPORT, with the context as its evidence ───────────────
+# Live 2026-10-01, GPTR_MCP_VERIFY=true: s24's jev gate made the context raw passages in
+# Source:/Title:/Content: blocks (0 `[Source:` tags on a real run), the audit ran BEFORE
+# synthesis over that context, found nothing it could judge, spent a Sonnet session and
+# shipped overall_confidence 0.9 with 0 unsupported / 0 contradictions. A scraped passage
+# supports itself; the report written from the passages is what can drift.
+STRIPE = "https://docs.stripe.com/api/idempotent_requests"
+BLOG = "https://blog.example.com/outbox"
+GATED_CONTEXT = "\n\n".join([
+    f"Source: {STRIPE}\nTitle: Idempotent requests | Stripe\nContent: Stripe keeps "
+    "idempotency keys for at least 24 hours, after which a reused key is treated as a new "
+    "request. Keys may be up to 255 characters long.",
+    f"Source: {BLOG}\nTitle: Outbox notes\nContent: The relay reads the outbox table and "
+    "publishes each row to the broker at least once. " + "Filler about brokers. " * 60,
+    "Source: https://other.example.com/x\nTitle: Unrelated\nContent: "
+    + "Gardening tips for spring planting and soil care. " * 30,
+])
+REPORT = "\n".join([
+    "> **Partial research.** This research stopped early because its time budget ran out.",
+    "",
+    "# Idempotency keys",
+    "",
+    "## Retention",
+    "",
+    f"Stripe keeps idempotency keys for at least 24 hours ([Stripe, 2024]({STRIPE})). "
+    "What happens after that?",
+    "",
+    "This report synthesizes the findings below.",
+    "",
+    f"The outbox relay publishes each row to the broker at least once ([Blog]({BLOG})).",
+    "",
+    "| Property | Stripe |",
+    "|---|---|",
+    "| Max key length | 255 characters |",
+    "",
+    "## References",
+    "",
+    f"Stripe. (2024). Idempotent requests. {STRIPE}",
+])
+REPORT_CLAIMS = [
+    "Stripe keeps idempotency keys for at least 24 hours.",
+    "The outbox relay publishes each row to the broker at least once.",
+    "Property: Max key length; Stripe: 255 characters",
+]
+
+
+def _report_audit(report=REPORT, context=GATED_CONTEXT, researcher=None):
+    return asyncio.run(verification.audit_faithfulness(
+        researcher or _Researcher(), "q", context, [], report=report))
+
+
+def test_report_claims_are_split_deterministically():
+    claims = verification.extract_report_claims(REPORT)
+
+    # not claims: the banner, headings, a question, a sentence about the report itself,
+    # the table's header and separator, everything under References
+    assert [c["claim"] for c in claims] == REPORT_CLAIMS
+    assert claims[0]["urls"] == [STRIPE] and claims[0]["kind"] == "number"
+    assert claims[2]["kind"] == "table_row"
+
+
+def test_a_quote_or_code_span_is_not_split_into_half_claims():
+    """Measured on the 2026-10-01 reports: a two-sentence quotation and
+    `INSERT ... ON CONFLICT` each came out as two fragments no passage could support."""
+    claims = verification.extract_report_claims(
+        'The guide warns: "the key can expire while the operation is still processing. A '
+        'new request arrives and proceeds." It recommends `INSERT ... ON CONFLICT DO '
+        'NOTHING` for the claim step in Postgres.')
+
+    assert len(claims) == 2, [c["claim"] for c in claims]
+    assert "A new request arrives" in claims[0]["claim"]
+    assert "INSERT ... ON CONFLICT DO NOTHING" in claims[1]["claim"]
+
+
+def test_a_gated_context_with_a_report_is_audited_by_jev_not_the_llm(judge, llm_calls):
+    """The production defect: this exact shape fell back to the LLM with "no [Source:
+    url]-tagged claims in the context to check"."""
+    out = _report_audit()
+
+    assert llm_calls["n"] == 0, f"spent a Sonnet session: {out.get('jev_fallback')}"
+    assert out["audit_engine"] == "jev" and out["audit_target"] == "report"
+    assert "jev_fallback" not in out
+    assert [s["claim"] for s in judge["states"]] == REPORT_CLAIMS, (
+        "the judge was not asked about the report's claims")
+    assert out["jev"]["claims_by_scope"] == {"report": 3, "context": 0}
+    for key in ("unsupported_claims", "contradictions", "overall_confidence", "notes",
+                "evidence_chars", "evidence_truncated"):
+        assert key in out, f"output contract lost {key!r}"
+
+
+def test_each_report_claim_is_shown_the_passage_that_carries_its_figure(judge, llm_calls):
+    """Evidence is RETRIEVED per claim from the context, not the context's head."""
+    _report_audit()
+
+    by_claim = {s["claim"]: s["section"] for s in judge["states"]}
+    assert "at least 24 hours" in by_claim[REPORT_CLAIMS[0]]
+    assert "publishes each row to the broker" in by_claim[REPORT_CLAIMS[1]]
+    assert "255 characters" in by_claim[REPORT_CLAIMS[2]]
+    assert not any(s.startswith("[Unrelated]") for s in by_claim.values()), (
+        "an unrelated passage was ranked first")
+
+
+def test_an_edited_number_in_the_report_lands_in_contradictions(judge, llm_calls):
+    """Live 2026-10-01: six numbers edited in copies of two real reports all came back
+    contradicts. Here: the plumbing from that verdict to the field callers act on."""
+    bad = REPORT.replace("at least 24 hours", "at least 90 days")
+    judge["answers"] = {"90 days": ("contradicts", 0.93)}
+
+    out = _report_audit(report=bad)
+
+    [c] = out["contradictions"]
+    assert set(c) == {"topic", "a", "b", "sources"}, "the contradiction shape changed"
+    assert "90 days" in c["a"] and "24 hours" in c["b"] and STRIPE in c["sources"]
+    assert out["overall_confidence"] < 1.0
+
+
+def test_a_report_quote_absent_from_the_context_needs_no_judge_call(judge, llm_calls):
+    """Live 2026-10-01: 3 of 70 claims quoted words the context does not contain
+    ("to avoid punishing a client" where the page says "would punish a client")."""
+    bad = REPORT.replace("## References", 'Stripe says keys "must never be reused across '
+                         'distinct payments".\n\n## References')
+
+    out = _report_audit(report=bad)
+
+    assert any(u["reason"].startswith("quote-not-in-source:") and "research context" in
+               u["reason"] for u in out["unsupported_claims"])
+    assert not any("never be reused" in s["claim"] for s in judge["states"])
+
+
+class _Embeddings:
+    """Deterministic stand-in: a claim and a passage sharing a marker word get close
+    vectors. `fail` makes it raise like an unreachable embedder."""
+
+    def __init__(self, fail=False):
+        self.fail, self.calls = fail, 0
+
+    def embed_documents(self, texts):
+        self.calls += 1
+        if self.fail:
+            raise ConnectionError("embedder unreachable")
+        marks = ("24 hours", "broker", "255", "gardening")
+        return [[1.0 if m in t.lower() else 0.0 for m in marks] + [0.01] for t in texts]
+
+
+class _MemResearcher(_Researcher):
+    def __init__(self, emb):
+        self.memory = type("M", (), {"get_embeddings": lambda _s: emb})()
+
+
+def test_retrieval_is_hybrid_with_embeddings_and_lexical_without(judge, llm_calls):
+    emb = _Embeddings()
+    out = _report_audit(researcher=_MemResearcher(emb))
+    assert emb.calls == 1 and out["jev"]["retrieval"] == "hybrid"
+
+    judge["states"].clear()
+    out = _report_audit(researcher=_MemResearcher(_Embeddings(fail=True)))
+
+    # fail open: a dead embedder degrades the ranking, it does not skip the audit
+    assert out["audit_engine"] == "jev" and out["jev"]["retrieval"] == "lexical"
+    assert llm_calls["n"] == 0 and len(judge["states"]) == 3
+
+
+def test_old_shape_with_a_report_audits_both_hops(judge, llm_calls):
+    """jev gate off: learnings carry [Source: url]. page -> learning and learning ->
+    report are two separate places to drift, so both are checked."""
+    out = asyncio.run(verification.audit_faithfulness(
+        _Researcher(), "q", CONTEXT, SOURCES, report=REPORT))
+
+    assert out["audit_engine"] == "jev" and out["audit_target"] == "report+context"
+    assert out["jev"]["claims_by_scope"] == {"report": 3, "context": 2}
+    asked = [s["claim"] for s in judge["states"]]
+    assert REPORT_CLAIMS[0] in asked
+    assert "27.67% of AI-authored PRs hit merge conflicts." in asked
+
+
+def test_no_report_and_a_gated_context_falls_back_and_says_why(judge, llm_calls):
+    """Synthesis failed: nothing jev can judge. The LLM audit runs (never skipped), and
+    the response says the report was missing, so this is not read as a report audit."""
+    out = _report_audit(report=None)
+
+    assert llm_calls["n"] == 1
+    assert out["audit_engine"] == "llm" and out["audit_target"] == "context"
+    assert "no [Source" in out["jev_fallback"] and "no report" in out["jev_fallback"]
+
+
+def test_a_report_with_no_checkable_claims_falls_back_and_says_why(judge, llm_calls):
+    out = _report_audit(report="# Title\n\n## Section\n\nWhat next?")
+
+    assert llm_calls["n"] == 1 and out["audit_engine"] == "llm"
+    assert "no checkable claims in the report" in out["jev_fallback"]
+
+
+def test_with_jev_off_the_llm_audits_the_report_not_the_context(judge, llm_calls,
+                                                                 monkeypatch):
+    seen = {}
+
+    async def fake(**kwargs):
+        seen.update(kwargs)
+        llm_calls["n"] += 1
+        return json.dumps(LLM_AUDIT)
+
+    monkeypatch.setattr(llm, "create_chat_completion", fake)
+    monkeypatch.setattr(jev, "enabled", lambda: False)
+
+    out = _report_audit()
+
+    assert out["audit_engine"] == "llm" and out["audit_target"] == "report"
+    assert out["jev_fallback"] == "jev not configured or in failure cooldown"
+    system, user = (m["content"] for m in seen["messages"])
+    assert "REPORT" in system and "ABSENCE IS NOT DISAGREEMENT" in system
+    assert "REPORT (the claims to audit)" in user and REPORT_CLAIMS[1][:30] in user
+
+
+def test_when_both_engines_fail_jev_fallback_is_still_a_field(judge, llm_calls,
+                                                              monkeypatch):
+    """A broken judge must not look like a confident one: "could not audit" carries the
+    same jev_fallback field as "audited by the LLM instead"."""
+    monkeypatch.setattr(jev, "enabled", lambda: False)
+    llm_calls["reply"] = "I could not audit this."
+
+    out = asyncio.run(verification.verify_research(_Researcher(), "q", GATED_CONTEXT, [],
+                                                   report=REPORT))
+
+    assert "unsupported_claims" not in out and "overall_confidence" not in out
+    assert out["audit_engine"] == "none" and out["audit_error"]
+    assert out["jev_fallback"] == "jev not configured or in failure cooldown"
+    assert out["audit_scopes"]["report"]["status"] == "could_not_audit"
+
+
+# ── Per-scope accounting: a scope the judge broke on is never hidden by one it did not ──
+# Review 2026-10-01 (verify-review-probe/failopen.py, "report scope all fail"): old shape,
+# 40 [Source: url] learnings + a 3-claim report, jev failing on every report state and
+# fine on every context state. Summed, 3 failed of 43 sat under the 25% line, and the
+# response said audit_engine jev, 0 unsupported, 0 contradictions, overall_confidence
+# 0.93 with the report never checked.
+LEARNINGS = "\n".join(f"Fact number {i} about idempotency keys holds true. [Source: {A}]"
+                      for i in range(40))
+FACT_PAGE = [{"url": A, "title": "a",
+              "raw_content": "Fact number holds true about idempotency keys. " * 20}]
+
+
+def _old_shape_audit():
+    return asyncio.run(verification.verify_research(
+        _Researcher(), "q", LEARNINGS + "\n" + GATED_CONTEXT, FACT_PAGE, report=REPORT))
+
+
+def test_a_broken_report_scope_is_not_hidden_by_a_good_context_scope(judge, llm_calls):
+    judge["answers"] = {c[:25]: None for c in REPORT_CLAIMS}
+
+    out = _old_shape_audit()
+
+    # The report was audited, by the LLM pass: never "jev, 0 findings" over a report
+    # nothing judged.
+    assert llm_calls["n"] == 1, "the broken report scope did not fall back to the LLM"
+    assert out["audit_engine"] == "llm" and out["audit_target"] == "report"
+    assert out["unsupported_claims"] == LLM_AUDIT["unsupported_claims"]
+    assert "judged none of 3 report claims" in out["jev_fallback"], out["jev_fallback"]
+    assert "40 judged learnings were dropped" in out["jev_fallback"]
+    assert out["audit_scopes"]["report"] == {"status": "audited", "engine": "llm",
+                                             "reason": None}
+    assert out["audit_scopes"]["context"]["status"] == "not_run"
+
+
+def test_a_broken_context_scope_keeps_the_report_audit_and_says_so(judge, llm_calls):
+    judge["answers"] = {"Fact number": None}
+
+    out = _old_shape_audit()
+
+    assert llm_calls["n"] == 0 and out["audit_engine"] == "jev"
+    # audit_target and jev_fallback are the pre-existing fields: a caller that never reads
+    # audit_scopes still sees that the context was not part of this audit.
+    assert out["audit_target"] == "report"
+    assert "context scope not audited" in out["jev_fallback"]
+    ctx = out["audit_scopes"]["context"]
+    assert ctx["status"] == "could_not_audit" and ctx["engine"] == "jev"
+    assert (ctx["asked"], ctx["judged"], ctx["failed"]) == (40, 0, 40)
+    rep = out["audit_scopes"]["report"]
+    assert rep["status"] == "audited" and (rep["judged"], rep["failed"]) == (3, 0)
+    # Nothing from the unaudited scope reaches the findings or the confidence: 3 report
+    # claims verified of 3, not 3 of 43.
+    assert out["jev"]["claims"] == 3 and out["overall_confidence"] == 1.0
+    assert not any(r["scope"] == "context" for r in out["needs_review"])
+    assert "NOT audited" in out["notes"]
+
+
+def test_every_outcome_names_each_scope(judge, llm_calls):
+    clean = _report_audit()
+    assert "jev_fallback" not in clean
+    assert clean["audit_scopes"]["report"]["status"] == "audited"
+    assert clean["audit_scopes"]["context"]["status"] == "not_run"
+
+    no_report = _report_audit(report=None)
+    assert no_report["audit_scopes"]["report"] == {
+        "status": "not_run", "engine": None, "reason": "no report was given to audit"}
+    assert no_report["audit_scopes"]["context"]["engine"] == "llm"
+
+
+def test_the_reviewers_transport_scenario_reproduced(llm_calls, monkeypatch):
+    """The probe's exact shape, through the real jev client: HTTP 400 on every
+    report-question state, a good answer on every context state."""
+    import urllib.error
+
+    def post(body, headers):
+        st = json.loads(body)
+        if "research report" in st["questions"]["relation"]["instructions"]:
+            raise urllib.error.HTTPError("u", 400, "state too large", {}, None)
+        return {"answers": {"relation": {"type": "choice", "choice": "supports",
+                                         "confidence": 0.95}}, "usage": {"cost": 0.0001}}
+
+    monkeypatch.delenv("GPTR_MCP_VERIFY_ENGINE", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "x")
+    monkeypatch.setattr(jev, "MODEL", "typesafe/jev-test")
+    monkeypatch.setattr(jev, "MAX_RETRIES", 0)
+    monkeypatch.setattr(jev, "_BREAKER_AFTER", 10 ** 6)
+    monkeypatch.setattr(jev, "_consecutive_failures", 0)
+    monkeypatch.setattr(jev, "_retry_after", 0.0)
+    monkeypatch.setattr(jev, "_post", post)
+
+    out = _old_shape_audit()
+
+    assert not (out["audit_engine"] == "jev" and out["unsupported_claims"] == []), (
+        "a report nothing judged shipped as a clean jev audit")
+    assert llm_calls["n"] == 1 and out["audit_engine"] == "llm"
+    assert out["audit_scopes"]["report"]["status"] == "audited"
+    assert out["audit_scopes"]["report"]["engine"] == "llm"

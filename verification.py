@@ -160,10 +160,13 @@ def _parse_json(text):
 #   3. a verdict stands only at confidence >= AUTO_ACCEPT (the cookbook's 0.8); below it
 #      the verdict is escalated to `needs_review` instead of being decided here.
 #
-# Claims come from deep_research's own format, `<learning> [Source: <url>]`, one per line
-# (gpt_researcher/skills/deep_research.py builds it). That tag is what makes a claim
-# checkable at all: it names the page whose scraped text we hold in `sources`. Lines
-# without one are raw evidence blocks, not claims, and are not judged.
+# Two claim sources (see "Report audit" below for why the report is now the main one):
+#   - the REPORT's sentences, judged against the passages of the context most similar to
+#     each (retrieve-then-judge), whenever there is a report;
+#   - context learnings in deep_research's pre-s24 format, `<learning> [Source: <url>]`,
+#     one per line (only with the jev gate off). That tag names the page whose scraped
+#     text we hold in `sources`, so each is judged against its page. Lines without one
+#     are raw evidence blocks, not claims, and are not judged as claims.
 
 #: deep_research writes "[Source: u]"; a learning backed by two pages comes out as
 #: "[Source: u1, u2]" or "u1 ; u2" (both seen in outputs/, 10 of 645 tags).
@@ -353,40 +356,346 @@ def _section_for(claim, pages, size):
     return section, sum(len(p) for p in pages), missing
 
 
-async def _audit_with_jev(context, sources):
-    """The cookbook citation check over every tagged claim. Returns (result, None), or
-    (None, reason) when the LLM audit has to run instead.
+def _missing_quote(claim, haystack_norm):
+    """The first long quoted span of `claim` absent from the normalised haystack, else None.
+    Same matching rules as _section_for (edge punctuation, ellipsis, quote pairing)."""
+    for q in (a or b for a, b in _QUOTED.findall(claim)):
+        if len(q.split()) < _QUOTE_MIN_WORDS or q != q.strip():
+            continue
+        parts = [_norm_text(f).strip(" .,;:!?'\"") for f in re.split(r"\.\.\.|…", q)]
+        parts = [f for f in parts if f]
+        if parts and not all(f in haystack_norm for f in parts):
+            return q
+    return None
 
-    Never returns a result that judged nothing: an audit with zero findings because it
-    looked at zero claims is the hollow clean bill of health _parse_json warns about.
+
+# ── Report audit: the claims of the synthesis, checked against the research ──────────
+# Live 2026-10-01, GPTR_MCP_VERIFY=true in production: audit_engine=llm, one `verify`
+# session, jev_fallback "no [Source: url]-tagged claims in the context to check",
+# overall_confidence 0.9, 0 unsupported, 0 contradictions. s24's jev gate had removed the
+# per-sub-query learnings step that wrote those tags; the context is now raw selected
+# passages in Source:/Title:/Content: blocks (`grep -c "\[Source:"` = 0 on a real run).
+# Two streams, each right alone, incompatible together.
+#
+# Teaching extract_claims the block format would not have fixed it: the audit ran BEFORE
+# synthesis, over the context, and a raw scraped passage always supports itself. What can
+# drift in this architecture is the one report Sonnet writes at the end from those
+# passages. So the claims now come from the REPORT and the evidence is the CONTEXT -- a
+# claim against its evidence, which is what the citation-check cookbook does.
+
+#: The server's own partial-research banner (server._partial_banner) is a disclosure we
+#: wrote, not a claim the writer made.
+_BANNER = re.compile(r"^>\s*\*\*Partial research\.\*\*")
+#: Where the report stops making claims: the bibliography.
+_REFS_HEADING = re.compile(
+    r"^#{1,6}\s*(?:\d+[.)]?\s*)?(references|sources|bibliography|works cited|citations)\b",
+    re.I)
+_TABLE_SEP = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+_LIST_MARK = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
+_MD_LINK = re.compile(r"\[([^\]]*)\]\((https?://[^)\s]+)\)")
+#: "([Stripe, 2024](u))" or "([A](u); [B](v))": a citation group, not part of the assertion.
+_CITE_GROUP = re.compile(
+    r"\s*\(\s*\[[^\]]*\]\(https?://[^)\s]+\)(?:\s*[;,]\s*\[[^\]]*\]\(https?://[^)\s]+\))*"
+    r"\s*\)")
+#: Periods that do not end a sentence. Kept short on purpose: an unlisted abbreviation
+#: splits one claim into two shorter ones, which still get judged.
+_ABBREV = re.compile(r"\b(e\.g|i\.e|vs|etc|n\.d|et al|cf|approx|Fig|No|Dr|Mr|Ms|St|U\.S)\.",
+                     re.I)
+_SENT_END = re.compile(r"(?<=[.!?])[\"'”)\]*_]*\s+(?=[\"'“(\[*_`]?[A-Z0-9$])")
+#: Openers that make a sentence a guess rather than an assertion.
+_HEDGE = re.compile(
+    r"^(perhaps|possibly|arguably|presumably|conceivably|it (is|seems|appears) "
+    r"(possible|plausible|likely|unclear)|it (may|might|could)|one (may|might|could)|"
+    r"this (may|might|could) )", re.I)
+#: A sentence about the report itself ("This report synthesizes ...") asserts nothing
+#: the research could support or refute.
+_META = re.compile(r"\b(this|the following|the present) (report|section|analysis|document|"
+                   r"synthesis|overview|summary|table)\b|\bthe (table|sections?) below\b",
+                   re.I)
+_CLAIM_MIN_WORDS = 5
+#: "*Source: [se.dosibridge.com, n.d.](u)*" under a table: a citation, not a claim.
+_CAPTION = re.compile(r"^(sources?|adapted from|via)\s*:", re.I)
+
+
+def _clean_claim(text):
+    """Claim text as the judge should read it, and the urls it cites."""
+    urls = [u for _, u in _MD_LINK.findall(text)]
+    t = _CITE_GROUP.sub("", text)
+    t = _MD_LINK.sub(r"\1", t)
+    t = re.sub(r"\*\*|__|(?<!\w)[*_](?!\s)|(?<!\s)[*_](?!\w)", "", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+([.,;:!?])(?=\s|$)", r"\1", t)  # the gap a removed citation left
+    return t, urls
+
+
+def _claim_kind(text):
+    """Why a sentence counts: a figure, a named thing, or a plain definite assertion."""
+    if re.search(r"\d", text):
+        return "number"
+    words = text.split()
+    if any(re.match(r"^[\"'(`]*(?:[A-Z][a-z]+[A-Z]\w*|[A-Z]{2,}\w*|[A-Z][a-z]+)", w)
+           for w in words[1:]) or "`" in text:
+        return "entity"
+    return "assertion"
+
+
+def _split_sentences(text):
+    """Sentences, never split inside a quotation or a code span. Measured on the
+    2026-10-01 reports: a quoted two-sentence passage ('"... still processing. A new
+    request arrives ..."') and `INSERT ... ON CONFLICT` both came out as two half-claims,
+    the second of which no passage could support on its own."""
+    def hide(m):
+        t = m.group(0)
+        # US style ends the sentence inside the marks ('... proceeds." It ...'): the
+        # punctuation right before a closing quote still ends a sentence.
+        tail = t[-2:] if len(t) > 2 and t[-1] in "\"”" and t[-2] in ".?!" else ""
+        body = t[:len(t) - len(tail)]
+        return body.replace(".", "\x00").replace("?", "\x01").replace("!", "\x02") + tail
+
+    protected = re.sub(r"`[^`]*`|\"[^\"]*\"|“[^“”]*”", hide, text)
+    protected = _ABBREV.sub(hide, protected)
+    return [s.replace("\x00", ".").replace("\x01", "?").replace("\x02", "!").strip()
+            for s in _SENT_END.split(protected) if s.strip()]
+
+
+def extract_report_claims(report):
+    """Deterministic claim split of a markdown report. No LLM.
+
+    A claim is a body sentence or a table row that asserts something: it carries a figure,
+    a named entity, or is a definite declarative statement. Not claims: headings, the
+    partial banner, code, lead-ins ending in ':', questions, hedged openers, sentences
+    about the report itself, fragments under five words, and everything from the
+    References heading on. Each claim keeps the urls it cites inline.
     """
-    if os.getenv("GPTR_MCP_VERIFY_ENGINE", "auto").strip().lower() == "llm":
-        return None, "GPTR_MCP_VERIFY_ENGINE=llm"
+    units = []                                   # (text, is_table_row)
+    para, header, in_code = [], None, False
+
+    def flush():
+        if para:
+            units.append((" ".join(para), False))
+            para.clear()
+
+    for raw in (report or "").splitlines():
+        line = raw.strip()
+        if line.startswith("```"):
+            flush()
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        if _REFS_HEADING.match(line):
+            break
+        if not line or line.startswith("#") or re.fullmatch(r"[-*_]{3,}", line) \
+                or _BANNER.match(line) or re.fullmatch(r"_[^_].*_", line):
+            flush()
+            header = None if not line.startswith("|") else header
+            continue
+        if line.startswith("|"):
+            flush()
+            cells = [c.strip() for c in line.strip("|").split("|")]
+            if _TABLE_SEP.match(line):
+                continue
+            if header is None:
+                header = cells
+                continue
+            # A row is a claim only with its column names: "| 409 | Conflict |" alone
+            # says nothing a page could support.
+            units.append(("; ".join(f"{h}: {c}" for h, c in zip(header, cells)
+                                    if c and c not in ("-", "--")), True))
+            continue
+        header = None
+        if _LIST_MARK.match(line):
+            flush()
+            line = _LIST_MARK.sub("", line)
+        para.append(line.lstrip("> ").strip())
+    flush()
+
+    claims, seen = [], set()
+    for text, is_row in units:
+        sentences = [text] if is_row else _split_sentences(text)
+        for s in sentences:
+            claim, urls = _clean_claim(s)
+            if not claim.strip(" .;:") or _CAPTION.match(claim):
+                # a citation group that landed after the period belongs to the sentence
+                # before it
+                if urls and claims:
+                    claims[-1]["urls"] += [u for u in urls if u not in claims[-1]["urls"]]
+                continue
+            if (claim.endswith("?") or claim.endswith(":") or _HEDGE.match(claim)
+                    or (_META.search(claim) and not re.search(r"\d", claim))
+                    or len(re.findall(r"\w+", claim)) < _CLAIM_MIN_WORDS):
+                continue
+            key = _norm_text(claim)
+            if key in seen:
+                continue
+            seen.add(key)
+            claims.append({"claim": claim, "urls": urls,
+                           "kind": "table_row" if is_row else _claim_kind(claim)})
+    return claims
+
+
+#: The persisted context's block header (utils.format_context_with_sources / the jev gate).
+_SOURCE_HDR = re.compile(r"^Source:\s*(\S+)\s*$", re.M)
+_ALSO = re.compile(r"^\[Also reported by:[^\]]*\]\s*$", re.M)
+
+
+def _context_passages(context, size):
+    """The research context cut into retrievable passages: [{"url", "text"}], in order.
+
+    Both shapes: `[Source: url]`-tagged learning lines (jev gate off) are one passage
+    each; `Source:/Title:/Content:` blocks (gate on) are windowed to `size` chars, each
+    window keeping its block's url and title.
+    """
+    ctx = context or ""
+    out, rest = [], []
+    for line in ctx.splitlines():
+        m = _CLAIM_TAG.match(line.strip())
+        if m:
+            urls = [u.strip() for u in _URL_SPLIT.split(m.group("urls")) if u.strip()]
+            out.append({"url": urls[0] if urls else "", "text": m.group("claim").strip()})
+        else:
+            rest.append(line)
+    ctx = "\n".join(rest)
+    hdrs = list(_SOURCE_HDR.finditer(ctx))
+    blocks = [("", ctx[:hdrs[0].start()] if hdrs else ctx)]
+    for i, m in enumerate(hdrs):
+        end = hdrs[i + 1].start() if i + 1 < len(hdrs) else len(ctx)
+        blocks.append((m.group(1), ctx[m.end():end]))
+    for url, body in blocks:
+        body = _ALSO.sub("", body)
+        title = ""
+        tm = re.match(r"\s*Title:\s*(.*)", body)
+        if tm:
+            title, body = tm.group(1).strip(), body[tm.end():]
+        body = re.sub(r"^\s*Content:\s*", "", body)
+        if len(body.strip()) < 40:                  # a header with nothing under it
+            continue
+        for win in _windows(body.strip(), size):
+            out.append({"url": url, "text": f"[{title}]\n{win}" if title else win})
+    return out
+
+
+async def _embed_texts(embeddings, texts):
+    """Vectors for `texts`, or None. Fail-open: without vectors retrieval goes lexical.
+
+    Bounded because this runs after synthesis, inside the caller's wait. Measured
+    2026-10-01 on the host: 230-240 texts in 17-37s normally, and once 411s when the
+    local embedder was busy -- the run that hit the bound finished on lexical ranking.
+    """
+    if embeddings is None or not texts:
+        return None
+    import asyncio
     try:
-        from gpt_researcher.utils import jev
-    except ImportError:                                        # pragma: no cover
-        return None, "jev client not importable"
-    if not jev.enabled():
-        return None, "jev not configured or in failure cooldown"
+        vecs = await asyncio.wait_for(
+            asyncio.to_thread(embeddings.embed_documents, list(texts)),
+            timeout=_env_float("VERIFY_EMBED_TIMEOUT_S", 120))
+        if not isinstance(vecs, list) or len(vecs) != len(texts):
+            raise ValueError(f"{len(vecs) if isinstance(vecs, list) else vecs!r} vectors "
+                             f"for {len(texts)} texts")
+        return vecs
+    except Exception as exc:                                    # noqa: BLE001
+        logger.warning(f"verify: evidence embeddings unavailable ({exc!r}); ranking "
+                       f"passages lexically")
+        return None
 
-    ctx = context if isinstance(context, str) else str(context)
-    claims = extract_claims(ctx)
-    if not claims:
-        return None, "no [Source: url]-tagged claims in the context to check"
-    # ponytail: first N claims in context order. jev is ~$0.03 per 1000 passages, so the
-    # cap bounds latency, not money; raise it before reaching for sampling.
-    cap = int(_env_float("VERIFY_JEV_MAX_CLAIMS", 120))
-    dropped = max(0, len(claims) - cap)
-    claims = claims[:cap]
-    auto_accept = _env_float("VERIFY_JEV_AUTO_ACCEPT", 0.8)
-    size = int(_env_float("VERIFY_JEV_SECTION_CHARS", 3000))
+
+#: Reciprocal-rank-fusion constant (the usual 60): a passage's fused score is
+#: sum(1 / (RRF_K + rank)) over the two rankings.
+_RRF_K = 60
+
+
+async def _rank_evidence(claims, passages, embeddings):
+    """Per claim, every passage index ranked best-first, and how they were ranked.
+
+    RANK, DO NOT THRESHOLD: the judge reads the top k whatever the similarity, so a run
+    whose scores sit low still shows each claim its best evidence.
+
+    Hybrid, because neither ranking alone held up on the 2026-10-01 reports. Embeddings
+    alone never surfaced the passage behind "Replay window; API v1: At least 24 hours;
+    API v2: 30 days" -- a markdown table row, which embeds poorly -- until k=12, so the
+    judge said says_nothing at 0.99 on a claim the context states almost verbatim; the
+    lexical ranking had it at rank 1. Lexical alone misses paraphrase. The two ranks are
+    fused (reciprocal rank fusion), which is still a ranking, not a score cutoff.
+    """
+    norm = [_norm_text(p["text"]) for p in passages]
+    lexical = []
+    for c in claims:
+        terms = _terms(c["claim"])
+        score = [sum(w for t, w in terms.items() if t in n) for n in norm]
+        lexical.append(sorted(range(len(passages)), key=lambda i: (-score[i], i)))
+    vecs = await _embed_texts(embeddings, [c["claim"] for c in claims]
+                              + [p["text"] for p in passages])
+    if vecs is None:
+        # ponytail: lexical only, claim-term overlap with figures weighted 3x. A
+        # paraphrase finds the wrong passage and comes back says_nothing -- unsupported
+        # or needs_review, never contradicts -- and the result says "lexical".
+        return lexical, "lexical"
+    import numpy as np
+    m = np.asarray(vecs, dtype=np.float32)
+    norms = np.linalg.norm(m, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    m = m / norms
+    sim = m[:len(claims)] @ m[len(claims):].T
+    fused = []
+    for row, lex in zip(sim, lexical):
+        rrf = np.zeros(len(passages))
+        rrf[np.argsort(-row, kind="stable")] += 1.0 / (_RRF_K + np.arange(len(passages)))
+        rrf[np.asarray(lex)] += 1.0 / (_RRF_K + np.arange(len(passages)))
+        fused.append([int(i) for i in np.argsort(-rrf, kind="stable")])
+    return fused, "hybrid"
+
+
+#: The report variant of the one relation question. Same three labels, same criteria;
+#: what changes is what `section` is -- retrieved passages of the research the report was
+#: written from, not the page a learning cites.
+_JEV_REPORT_QUESTIONS = {
+    "relation": {
+        "type": "choice",
+        "instructions": (
+            "How does `section` relate to `claim`? `claim` is a sentence from a research "
+            "report. `section` holds the passages of the research that report was written "
+            "from that are most similar to `claim`, separated by [...]; the rest of the "
+            "research is not shown."),
+        "criteria": _JEV_QUESTIONS["relation"]["criteria"],
+    },
+}
+
+
+def _report_rows(report_claims, ctx, passages, ranked, k):
+    """Rows + jev states for the report's claims. Cookbook step 1 (a quote absent from
+    the research needs no model call), then the top-k passages as the section."""
+    rows, states = [], []
+    ctx_norm = _norm_text(ctx)
+    for ci, c in enumerate(report_claims):
+        row = dict(claim=c["claim"], urls=c["urls"], scope="report", kind=c["kind"],
+                   verdict=None, confidence=None, auto=False, section="",
+                   page_chars=len(ctx), evidence_urls=[])
+        missing = _missing_quote(c["claim"], ctx_norm)
+        if missing is not None:
+            row.update(verdict="quote_not_in_source", auto=True, missing_quote=missing)
+        elif not passages:
+            row["verdict"] = "unverifiable"
+        else:
+            # Best-ranked first: a contradiction's `b` shows the head of the section.
+            top = [int(i) for i in ranked[ci][:k]]
+            row["section"] = "\n\n[...]\n\n".join(passages[i]["text"] for i in top)
+            row["evidence_urls"] = list(dict.fromkeys(
+                passages[i]["url"] for i in top if passages[i]["url"]))
+            states.append({"claim": c["claim"], "section": row["section"]})
+            row["_ask"] = ("report", len(states) - 1)
+        rows.append(row)
+    return rows, states
+
+
+def _context_rows(claims, sources, size):
+    """Rows + jev states for `[Source: url]`-tagged learnings, each against the page it
+    cites. The pre-report audit, unchanged."""
     texts = _source_texts(sources)
-
     rows, states = [], []
     for c in claims:
         pages = [texts[k] for k in (_norm_url(u) for u in c["urls"]) if k in texts]
-        row = dict(c, verdict=None, confidence=None, auto=False, section="",
-                   page_chars=0)
+        row = dict(c, scope="context", verdict=None, confidence=None, auto=False,
+                   section="", page_chars=0)
         if not pages:
             # The page was never obtained, or obtained empty. A hole in the evidence, not
             # evidence against the claim -- the `unretrieved` lesson in deep_research.
@@ -401,28 +710,99 @@ async def _audit_with_jev(context, sources):
                 row["verdict"] = "unverifiable"
             else:
                 states.append({"claim": c["claim"], "section": section})
-                row["_ask"] = len(states) - 1
+                row["_ask"] = ("context", len(states) - 1)
         rows.append(row)
+    return rows, states
 
+
+async def _no_states():
+    return []
+
+
+async def _audit_with_jev(context, sources, report=None, embeddings=None):
+    """The cookbook citation check. Returns (result, None), or (None, reason) when the
+    LLM audit has to run instead.
+
+    What it checks depends on what exists:
+      - a report: every claim in it, against the top-k passages of the research context
+        (either shape: Source:/Title:/Content: blocks or `[Source: url]` learnings);
+      - `[Source: url]`-tagged learnings in the context (jev gate off): each against the
+        page it cites, as before the report audit existed. With a report too, both run:
+        page -> learning and learning -> report are two separate places to drift, and
+        the report check alone would pass a report that faithfully repeats a learning
+        that misread its page.
+
+    Never returns a result that judged nothing: an audit with zero findings because it
+    looked at zero claims is the hollow clean bill of health _parse_json warns about.
+    """
+    if os.getenv("GPTR_MCP_VERIFY_ENGINE", "auto").strip().lower() == "llm":
+        return None, "GPTR_MCP_VERIFY_ENGINE=llm"
+    try:
+        from gpt_researcher.utils import jev
+    except ImportError:                                        # pragma: no cover
+        return None, "jev client not importable"
+    if not jev.enabled():
+        return None, "jev not configured or in failure cooldown"
+
+    ctx = context if isinstance(context, str) else str(context)
+    report_claims = extract_report_claims(report) if report else []
+    learnings = extract_claims(ctx)
+    if not report_claims and not learnings:
+        if report:
+            return None, ("no checkable claims in the report, and no [Source: url]-tagged "
+                          "claims in the context to check")
+        # Kept word for word at its head: it is how a caller recognises this case.
+        return None, ("no [Source: url]-tagged claims in the context to check, and no "
+                      "report was given to audit")
+    # ponytail: first N claims per scope, in order. jev is ~$0.03 per 1000 passages, so
+    # the cap bounds latency, not money; raise it before reaching for sampling.
+    cap = int(_env_float("VERIFY_JEV_MAX_CLAIMS", 120))
+    dropped = max(0, len(report_claims) - cap) + max(0, len(learnings) - cap)
+    report_claims, learnings = report_claims[:cap], learnings[:cap]
+    auto_accept = _env_float("VERIFY_JEV_AUTO_ACCEPT", 0.8)
+    size = int(_env_float("VERIFY_JEV_SECTION_CHARS", 3000))
+
+    rows, rep_states, retrieval, k, n_passages = [], [], None, 0, 0
+    if report_claims:
+        # k sweep, 2026-10-01, two real gate-on reports (70 + 67 claims), ~1000-char
+        # passages, hybrid ranking: claims changing bucket per step k=2->4: 2/4,
+        # 4->6: 1/2, 6->8: 4/2, 8->12: 3/2, against 2/0 between two identical k=4 runs.
+        # Verdicts stop moving at 4. Embedding-only ranking was still moving at 8.
+        k = int(_env_float("VERIFY_REPORT_EVIDENCE_K", 4))
+        passages = _context_passages(
+            ctx, int(_env_float("VERIFY_REPORT_PASSAGE_CHARS", 1000)))
+        n_passages = len(passages)
+        ranked, retrieval = ((await _rank_evidence(report_claims, passages, embeddings))
+                             if passages else ([], None))
+        rows, rep_states = _report_rows(report_claims, ctx, passages, ranked, k)
+    ctx_rows, ctx_states = _context_rows(learnings, sources, size)
+    rows += ctx_rows
+    asked = len(rep_states) + len(ctx_states)
+
+    import asyncio
     before = jev.stats()
-    answers = await jev.ask_many(states, _JEV_QUESTIONS) if states else []
+    rep_ans, ctx_ans = await asyncio.gather(
+        jev.ask_many(rep_states, _JEV_REPORT_QUESTIONS) if rep_states else _no_states(),
+        jev.ask_many(ctx_states, _JEV_QUESTIONS) if ctx_states else _no_states())
     after = jev.stats()
-    spent = {k: round(after.get(k, 0) - before.get(k, 0), 6)
-             for k in ("calls", "errors", "cost", "input_tokens")}
+    spent = {key: round(after.get(key, 0) - before.get(key, 0), 6)
+             for key in ("calls", "errors", "cost", "input_tokens")}
+    answers = {"report": rep_ans or [], "context": ctx_ans or []}
 
-    failed = 0
+    failed = {"report": 0, "context": 0}
     for row in rows:
-        i = row.pop("_ask", None)
-        if i is None:
+        ask = row.pop("_ask", None)
+        if ask is None:
             continue
-        ans = answers[i] if i < len(answers) else None
+        got = answers[ask[0]]
+        ans = got[ask[1]] if ask[1] < len(got) else None
         ans = ans if isinstance(ans, dict) else {}
         rel = ans.get("relation")
         # A label that is not a string (review 2026-10-01: a 200 whose `choice` was a
         # list) is one judge failure like an unknown label, not a TypeError on the dict
         # lookup that would discard every good verdict in the run.
         if not isinstance(rel, str) or rel not in _RELATION_TO_VERDICT:
-            failed += 1
+            failed[ask[0]] += 1
             row["verdict"] = "unjudged"
             continue
         conf = ans.get("relation__confidence")
@@ -436,78 +816,177 @@ async def _audit_with_jev(context, sources):
         # rejected by the type check.
         if (isinstance(conf, bool) or not isinstance(conf, (int, float))
                 or not 0.0 <= conf <= 1.0):
-            failed += 1
+            failed[ask[0]] += 1
             row["verdict"] = "unjudged"
             continue
         row.update(verdict=_RELATION_TO_VERDICT[rel], confidence=conf,
                    auto=conf >= auto_accept)
 
-    judged = len(states) - failed
-    if judged == 0:
-        # Nothing reached a verdict from the judge. Quote misses alone are not an audit
-        # of the run, and unverifiable claims are not findings at all.
-        return None, (f"jev judged none of {len(claims)} claims "
-                      f"({len(states)} asked, {failed} failed)")
+    # Judged, failed and the fallback decision are PER SCOPE, never summed across both.
+    # Review 2026-10-01 (verify-review-probe/failopen.py): old shape, a 3-claim report
+    # plus 40 [Source: url] learnings, jev answering HTTP 400 on every report state and
+    # fine on every context state. Summed, that was 3 failed of 43 asked, under the 25%
+    # line, and the response said audit_engine jev, 0 unsupported, 0 contradictions,
+    # overall_confidence 0.93 -- with the report, the one thing the caller reads, never
+    # checked. Fourth time this rule broke here (merge_stats on a 200 with no answers,
+    # `confidence: true`, the dedup judge's invisible timeouts): a broken judge must not
+    # look like a confident one, and that has to hold per scope.
     max_fail = _env_float("VERIFY_JEV_MAX_FAIL_FRAC", 0.25)
-    if failed / len(states) > max_fail:
-        # A judge that broke on a quarter of the claims has not audited the run. Partial
-        # silence would read as "those claims were fine"; the LLM pass reads them all.
-        return None, f"jev failed on {failed} of {len(states)} claims (> {max_fail:.0%})"
+    scopes, broken = {}, {}
+    for s, n, a in (("report", len(report_claims), len(rep_states)),
+                    ("context", len(learnings), len(ctx_states))):
+        if not n:
+            continue
+        f = failed[s]
+        scopes[s] = {"status": "audited", "engine": "jev", "reason": None,
+                     "claims": n, "asked": a, "judged": a - f, "failed": f}
+        if a - f == 0:
+            # Nothing in this scope reached a verdict from the judge. Quote misses alone
+            # are not an audit, and unverifiable claims are not findings at all.
+            broken[s] = f"jev judged none of {n} {s} claims ({a} asked, {f} failed)"
+        elif f / a > max_fail:
+            # A judge that broke on a quarter of a scope has not audited it. Partial
+            # silence would read as "those claims were fine".
+            broken[s] = f"jev failed on {f} of {a} {s} claims (> {max_fail:.0%})"
+        if s in broken:
+            scopes[s].update(status="could_not_audit", reason=broken[s])
 
-    return _jev_result(rows, auto_accept, dropped, spent), None
+    # What a broken scope costs. The REPORT must be audited, so a broken report scope runs
+    # the LLM pass over the report, as a wholly broken judge always did; a good context
+    # result is dropped with it, because that pass audits the report only and one
+    # overall_confidence cannot honestly mix the two engines' scales. A broken CONTEXT
+    # scope beside a good report scope keeps the report audit: the LLM fallback would
+    # audit exactly the report and nothing else, so falling back would trade a per-claim
+    # audit of the same target for a 12k-char excerpt pass. The context scope then ships
+    # as could_not_audit, outside audit_target, and is named in jev_fallback.
+    if "report" in broken or len(broken) == len(scopes):
+        why = "; ".join(broken.values())
+        if "report" in broken and "context" in scopes and "context" not in broken:
+            why += (f"; the context scope's {scopes['context']['judged']} judged learnings "
+                    f"were dropped with it: the LLM fallback audits the report only")
+        return None, why
+
+    rows = [r for r in rows if r["scope"] not in broken]
+    target = "+".join(s for s in ("report", "context") if s in scopes and s not in broken)
+    out = _jev_result(rows, auto_accept, dropped, spent, target)
+    out["jev"].update(retrieval=retrieval, evidence_k=k, passages=n_passages,
+                      claims_by_scope={"report": len(report_claims),
+                                       "context": len(learnings)})
+    out["audit_scopes"] = scope_status(report, ctx, scopes)
+    if broken:
+        out["jev_fallback"] = (f"context scope not audited ({broken['context']}); the "
+                               f"report scope was audited by jev and stands")
+        out["notes"] += (f" The context scope was NOT audited ({broken['context']}); "
+                         f"overall_confidence covers the report scope only.")
+    return out, None
 
 
-def _jev_result(rows, auto_accept, dropped, spent):
-    """Map cookbook verdicts onto the audit's existing output contract."""
+def scope_status(report, context, done):
+    """Per scope, what the audit did, for the response's `audit_scopes`. Both scopes are
+    always listed. `done` holds the entries for scopes an engine took on.
+
+    status is one of:
+      - "audited": an engine judged this scope, and its findings are in
+        unsupported_claims / contradictions and count in overall_confidence;
+      - "could_not_audit": an engine was asked and failed; nothing from this scope is in
+        the findings;
+      - "not_run": nothing in this scope was put to an engine; `reason` says why.
+    Only "audited" means the scope was checked. A caller must not read the absence of
+    findings for any other status as clean.
+    """
+    out = {}
+    for s in ("report", "context"):
+        if s in done:
+            out[s] = done[s]
+            continue
+        if s == "report":
+            why = ("no report was given to audit" if not report
+                   else "the report had no checkable claims")
+        elif not extract_claims(context if isinstance(context, str) else str(context)):
+            why = ("no [Source: url]-tagged learnings in the context; with a report it is "
+                   "the evidence, not a claim" if report else
+                   "no [Source: url]-tagged learnings in the context")
+        else:
+            why = "the LLM fallback audits the report only, not the context's learnings"
+        out[s] = {"status": "not_run", "engine": None, "reason": why}
+    return out
+
+
+def _jev_result(rows, auto_accept, dropped, spent, target="context"):
+    """Map cookbook verdicts onto the audit's existing output contract.
+
+    unsupported_claims and contradictions keep their exact pre-report entry shape (callers
+    and the skill's report render them); which scope a finding came from shows in its
+    reason text and in jev.verdicts_by_scope. needs_review entries carry `scope`.
+    """
     unsupported, contradictions, review = [], [], []
-    counts = {}
+    counts, by_scope = {}, {}
     for r in rows:
         v = r["verdict"]
         counts[v] = counts.get(v, 0) + 1
+        sc = by_scope.setdefault(r["scope"], {})
+        sc[v] = sc.get(v, 0) + 1
         conf = r["confidence"]
+        on_report = r["scope"] == "report"
         if v == "quote_not_in_source":
+            where = ("the research context the report was written from" if on_report
+                     else f"the scraped text of {', '.join(r['urls'])}")
             unsupported.append({"claim": r["claim"], "reason": (
                 f'quote-not-in-source: the quoted words "{r["missing_quote"]}" do not '
-                f"appear in the scraped text of {', '.join(r['urls'])}. Misquoted, or "
-                f"paraphrased inside quote marks; the page may also be only partly "
-                f"scraped, so this is not evidence the underlying claim is false.")})
+                f"appear in {where}. Misquoted, or paraphrased inside quote marks; "
+                + ("" if on_report else "the page may also be only partly scraped, so ")
+                + "this is not evidence the underlying claim is false.")})
         elif v in ("unverifiable", "unjudged") or not r["auto"]:
             # Below AUTO_ACCEPT the cookbook has a human confirm the verdict before
             # anything acts on it. Callers act on unsupported_claims/contradictions, so an
             # uncertain verdict must not land there; it is listed here instead, never
             # dropped.
-            review.append({"claim": r["claim"], "tentative": v,
-                           "confidence": conf, "sources": r["urls"]})
+            review.append({"claim": r["claim"], "scope": r["scope"], "tentative": v,
+                           "confidence": conf,
+                           "sources": r["urls"] or r.get("evidence_urls", [])})
         elif v == "unsupported":
-            unsupported.append({"claim": r["claim"], "reason": (
-                f"not-in-excerpt: the {len(r['section'])}-char section of the cited page "
-                f"shown to the judge (of {r['page_chars']} scraped chars) does not state "
-                f"this (jev says_nothing, confidence {conf:.2f}). Support may sit "
-                f"elsewhere on the page; absence is not disagreement.")})
+            if on_report:
+                reason = (
+                    f"not-in-excerpt: the {len(r['section'])} chars of research passages "
+                    f"most similar to this claim (of {r['page_chars']} context chars) do "
+                    f"not state it (jev says_nothing, confidence {conf:.2f}). Support may "
+                    f"sit in a passage not shown, or the sentence is the writer's own "
+                    f"synthesis; absence is not disagreement.")
+            else:
+                reason = (
+                    f"not-in-excerpt: the {len(r['section'])}-char section of the cited "
+                    f"page shown to the judge (of {r['page_chars']} scraped chars) does not "
+                    f"state this (jev says_nothing, confidence {conf:.2f}). Support may sit "
+                    f"elsewhere on the page; absence is not disagreement.")
+            unsupported.append({"claim": r["claim"], "reason": reason})
         elif v == "contradicted":
             contradictions.append({
                 "topic": r["claim"][:120],
                 "a": r["claim"],
                 "b": r["section"][:600],
-                "sources": r["urls"]})
+                "sources": r.get("evidence_urls") or r["urls"]})
     below = sum(1 for r in rows if r["verdict"] in _RELATION_TO_VERDICT.values()
                 and not r["auto"])
     verified = sum(1 for r in rows if r["verdict"] == "verified" and r["auto"])
     total = len(rows)
-    # Confidence = the share of the context's claims positively confirmed at or above
-    # AUTO_ACCEPT. Uncertain, unjudged and unverifiable claims count against it, so a run
-    # where the judge could confirm nothing reads as low confidence, never as clean.
+    # Confidence = the share of the claims positively confirmed at or above AUTO_ACCEPT.
+    # Uncertain, unjudged and unverifiable claims count against it, so a run where the
+    # judge could confirm nothing reads as low confidence, never as clean.
     overall = round(verified / total, 2) if total else 0.0
     shown = sum(len(r["section"]) for r in rows)
     excerpted = any(r["section"] and len(r["section"]) < r["page_chars"] for r in rows)
+    what = {"report": "report claims against the research passages most similar to each",
+            "context": "context claims against the page each cites",
+            "report+context": "report claims against the research passages most similar "
+                              "to each, and context claims against the page each cites"}
     notes = (
-        f"jev citation check over {total} claims"
+        f"jev citation check over {total} claims ({what.get(target, target)})"
         + (f" ({dropped} more past VERIFY_JEV_MAX_CLAIMS not checked)" if dropped else "")
         + f": {verified} verified, {len(unsupported)} unsupported, {len(contradictions)} "
         f"contradicted at confidence >= {auto_accept}; {len(review)} in needs_review "
-        f"({below} below the threshold, {counts.get('unverifiable', 0)} cite a page whose "
-        f"text was never obtained, {counts.get('unjudged', 0)} the judge failed on). Each "
-        f"claim was judged against an excerpt of the page it cites, not the whole page.")
+        f"({below} below the threshold, {counts.get('unverifiable', 0)} with no evidence "
+        f"to check against, {counts.get('unjudged', 0)} the judge failed on). Each claim "
+        f"was judged against an excerpt, not the whole research.")
     return {
         "unsupported_claims": unsupported,
         "contradictions": contradictions,
@@ -518,26 +997,52 @@ def _jev_result(rows, auto_accept, dropped, spent):
         "evidence_truncated": bool(dropped) or excerpted,
         "needs_review": review,
         "audit_engine": "jev",
+        # What was audited: "report", "context", or "report+context".
+        "audit_target": target,
         # What this audit cost, read next to agent_calls_by_site: the session it did not
         # spend on one side, fractions of a cent on the other.
         # ponytail: delta of process-wide counters, so a concurrent jev user (the P1 gate
         # in another run) leaks into it. Upgrade path: per-call usage from jev.ask.
         "jev": {**spent, "claims": total, "not_checked": dropped,
                 "auto_accept": auto_accept, "verdicts": counts,
-                "below_threshold": below},
+                "verdicts_by_scope": by_scope, "below_threshold": below},
     }
 
 
-async def audit_faithfulness(researcher, query, context, sources):
+class _AuditFailed(RuntimeError):
+    """Neither engine produced an audit. Carries why jev did not do the work, so the
+    response can name it in jev_fallback like every other non-jev outcome."""
+
+    def __init__(self, message, jev_fallback):
+        super().__init__(message)
+        self.jev_fallback = jev_fallback
+
+
+def _embeddings_of(researcher):
+    """The researcher's configured embedder (the one the jev gate and the s12 router
+    use), or None. Never raises: no embedder means lexical retrieval, not no audit."""
+    try:
+        return researcher.memory.get_embeddings()
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+async def audit_faithfulness(researcher, query, context, sources, report=None):
     """Unsupported-claim + contradiction audit: jev citation check first, LLM pass second.
 
-    The jev path costs no `claude` session; the LLM path costs one. When jev is off,
-    erroring, or has nothing it can judge, this is exactly the old single LLM pass, and
-    that fallback is the point: "fail open" here means "run the check we had", never
-    "skip the check", because a skipped audit and a clean one look identical downstream.
+    `report` is the synthesis written from `context`. Given one, its claims are what get
+    audited; without one (synthesis failed, or a caller holding only research), the
+    context is, as before. The jev path costs no `claude` session; the LLM path costs
+    one. When jev is off, erroring, or has nothing it can judge, this is exactly one LLM
+    pass, and that fallback is the point: "fail open" here means "run the check we had",
+    never "skip the check", because a skipped audit and a clean one look identical
+    downstream.
     """
+    report = report if isinstance(report, str) and report.strip() else None
     try:
-        jev_out, why_not = await _audit_with_jev(context, sources)
+        jev_out, why_not = await _audit_with_jev(
+            context, sources, report=report,
+            embeddings=_embeddings_of(researcher) if report else None)
     except Exception as e:                                     # noqa: BLE001
         # Review 2026-10-01: jev answered HTTP 200 with a malformed body (`answers` a
         # list, `usage` a string), the client raised, and the exception escaped to
@@ -550,17 +1055,40 @@ async def audit_faithfulness(researcher, query, context, sources):
     if jev_out is not None:
         return jev_out
     try:
-        result = await _audit_with_llm(researcher, query, context, sources)
+        result = await _audit_with_llm(researcher, query, context, sources, report=report)
     except Exception as e:
         # Keep why jev did not run in the audit_error verify_research ships: "the LLM
         # audit failed" and "both audits failed" call for different fixes.
-        raise RuntimeError(f"{e} [jev path not taken: {why_not}]") from e
+        raise _AuditFailed(f"{e} [jev path not taken: {why_not}]", why_not) from e
     result["audit_engine"] = "llm"
+    result["audit_target"] = target = "report" if report else "context"
     result["jev_fallback"] = why_not
+    result["audit_scopes"] = scope_status(report, context, {
+        target: {"status": "audited", "engine": "llm", "reason": None}})
     return result
 
 
-async def _audit_with_llm(researcher, query, context, sources):
+#: The LLM fallback's question when there IS a report: the report's claims are audited
+#: and the context is the evidence. The rules about what the auditor can see are the
+#: context audit's own, carried over, with one addition: a report claim the context
+#: refutes is a contradiction the auditor can actually see, so it may be reported.
+_VERIFY_REPORT_SYSTEM = (
+    "You audit a research REPORT for FAITHFULNESS to the research it was written from. "
+    "You do NOT add new facts. Given the QUERY, the REPORT, the gathered CONTEXT it was "
+    "written from, and the SOURCE list, you "
+    "(1) flag claims in the REPORT that the CONTEXT does not support, "
+    "(2) flag CONTRADICTIONS, (3) give an overall confidence 0-1. "
+    "Be specific; quote the claim.\n"
+    "WHAT YOU CAN SEE: CONTEXT is an EXCERPT of the research and may be truncated "
+    "mid-evidence; REPORT may be cut short too. SOURCES is a list of urls and titles ONLY "
+    "- you are NOT given the text of those pages. Report a contradiction ONLY when the "
+    "CONTEXT itself states both sides, or when the REPORT states one side and the CONTEXT "
+    "explicitly states the other.\n"
+    + _VERIFY_SYSTEM[_VERIFY_SYSTEM.index("ABSENCE IS NOT DISAGREEMENT"):]
+)
+
+
+async def _audit_with_llm(researcher, query, context, sources, report=None):
     """One LLM pass: unsupported-claim + contradiction audit. Reuses the researcher's
     SMART LLM (their claude_agent subscription -> no extra metered API cost)."""
     from gpt_researcher.utils.llm import create_chat_completion
@@ -573,17 +1101,25 @@ async def _audit_with_llm(researcher, query, context, sources):
         def agent_purpose(_site):
             return nullcontext()
 
-    ctx = context if isinstance(context, str) else str(context)
-    ctx = ctx[:12000]  # ponytail: bound the evidence fed into one call
-    user = (
-        f"QUERY:\n{query}\n\nCONTEXT (evidence):\n{ctx}\n\n"
-        f"SOURCES:\n{json.dumps(_compact_sources(sources), ensure_ascii=False)}"
-    )
+    full = context if isinstance(context, str) else str(context)
+    ctx = full[:12000]  # ponytail: bound the evidence fed into one call
+    srcs = json.dumps(_compact_sources(sources), ensure_ascii=False)
+    if report:
+        # ponytail: the first 24k chars of the report against the first 12k of the
+        # context. Most of a 160k-char context is unseen here, so expect not-in-excerpt;
+        # this is the fallback, and the jev path is the one that retrieves per claim.
+        rep, system = report[:24000], _VERIFY_REPORT_SYSTEM
+        user = (f"QUERY:\n{query}\n\nREPORT (the claims to audit):\n{rep}\n\n"
+                f"CONTEXT (evidence the report was written from):\n{ctx}\n\n"
+                f"SOURCES:\n{srcs}")
+    else:
+        rep, system = "", _VERIFY_SYSTEM
+        user = f"QUERY:\n{query}\n\nCONTEXT (evidence):\n{ctx}\n\nSOURCES:\n{srcs}"
     with agent_purpose("verify"):
         resp = await create_chat_completion(
             model=researcher.cfg.smart_llm_model,
             messages=[
-                {"role": "system", "content": _VERIFY_SYSTEM},
+                {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
             temperature=0.1,
@@ -618,21 +1154,34 @@ async def _audit_with_llm(researcher, query, context, sources):
         # what the audit was actually shown, so "unsupported" can be read for what it
         # is — see the evidence-bound note in _VERIFY_SYSTEM
         "evidence_chars": len(ctx),
-        "evidence_truncated": len(context if isinstance(context, str) else str(context)) > len(ctx),
+        "evidence_truncated": len(full) > len(ctx) or len(report or "") > len(rep),
     }
 
 
-async def verify_research(researcher, query, context, sources):
-    """Full bundle: deterministic tiering + LLM faithfulness audit. Tiering always
-    ships; audit failure degrades to tiers-only (best-effort, never blocks research)."""
+async def verify_research(researcher, query, context, sources, report=None):
+    """Full bundle: deterministic tiering + faithfulness audit. Tiering always ships;
+    audit failure degrades to tiers-only (best-effort, never blocks research).
+
+    Pass `report`, the synthesis, whenever there is one: it is what the audit checks.
+    """
     source_urls = [s.get("url", "") for s in (sources or []) if s.get("url")]
     tiers, tier_summary = tier_sources(source_urls)
     result = {"source_tiers": tiers, "tier_summary": tier_summary}
     try:
-        result.update(await audit_faithfulness(researcher, query, context, sources))
+        result.update(await audit_faithfulness(researcher, query, context, sources,
+                                               report=report))
     except Exception as e:  # audit is best-effort; tiering still ships
         logger.warning(f"faithfulness audit failed: {e}")
-        result["audit_error"] = str(e)
+        # Three outcomes stay distinguishable: audited (audit_engine jev/llm, the finding
+        # keys present), could not audit (this: audit_engine "none", audit_error, no
+        # finding keys), never ran (verification is null). jev_fallback is set whenever
+        # jev did not do the work. The same three hold per scope in audit_scopes.
+        result.update(audit_error=str(e), audit_engine="none",
+                      jev_fallback=getattr(e, "jev_fallback", None)
+                      or f"the audit raised before an engine ran: {type(e).__name__}")
+        target = "report" if isinstance(report, str) and report.strip() else "context"
+        result["audit_scopes"] = scope_status(report, context, {target: {
+            "status": "could_not_audit", "engine": None, "reason": str(e)}})
     return result
 
 
@@ -662,6 +1211,16 @@ def demo():
     _, _, missing = _section_for(
         'It says "agents never ever touch the main branch at all" plainly', [page], 3000)
     assert missing == "agents never ever touch the main branch at all", missing
+    # report claim split: headings, banner, questions, references are not claims; a table
+    # row carries its column names; a citation is metadata, not claim text
+    rc = extract_report_claims(
+        "> **Partial research.** This research stopped early.\n\n# Title\n\n"
+        "Stripe keeps keys for 24 hours ([Stripe, 2024](https://docs.stripe.com/x)). "
+        "Why does this matter?\n\n| Property | v1 |\n|---|---|\n| Window | 24 hours |\n\n"
+        "## References\n\nStripe. (2024). Docs. https://docs.stripe.com/x")
+    assert [c["claim"] for c in rc] == ["Stripe keeps keys for 24 hours.",
+                                        "Property: Window; v1: 24 hours"], rc
+    assert rc[0]["urls"] == ["https://docs.stripe.com/x"], rc
     print("verification.py self-check OK")
 
 

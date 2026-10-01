@@ -33,7 +33,7 @@ from utils import (
     persist_search_results,
 )
 from tiers import DEFAULT_TIER, TIERS, resolve as resolve_tier
-from verification import verify_research
+from verification import scope_status, verify_research
 
 
 def _with_refusal(result: Dict[str, Any]) -> Dict[str, Any]:
@@ -305,15 +305,6 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
                 "agent_calls_by_site": agent_calls_by_site(),
             })
 
-        # Optional post-research verification (source tiering + faithfulness audit).
-        # Off by default; enable per-call (verify=true) or globally (GPTR_MCP_VERIFY=true).
-        verification = None
-        if verify or os.getenv("GPTR_MCP_VERIFY", "false").strip().lower() in ("1", "true", "yes"):
-            try:
-                verification = await verify_research(researcher, query, context, sources)
-            except Exception as e:
-                logger.warning(f"Verification pass failed: {e}")
-
         # ALWAYS synthesize -- a time-truncated run above all. Measured 2026-09-21: a
         # run that spent its 600s budget came back as a 284KB context dump with no
         # report, because synthesis lived only in the separate write_report tool: a
@@ -333,6 +324,33 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
             report_error = f"{type(e).__name__}: {e}"
             logger.warning(f"Synthesis failed, returning the research without a report: "
                            f"{report_error}")
+
+        # Optional post-research verification (source tiering + faithfulness audit).
+        # Off by default; enable per-call (verify=true) or globally (GPTR_MCP_VERIFY=true).
+        #
+        # AFTER synthesis, and given the report. Live 2026-10-01: run before synthesis, it
+        # audited the context, found no `[Source: url]` learnings there (s24's jev gate
+        # had replaced them with raw passages), fell back to a Sonnet session and shipped
+        # 0 unsupported / 0 contradictions at confidence 0.9. A scraped passage supports
+        # itself; the report written from those passages is what can drift. Without a
+        # report (synthesis failed) the context is audited as before, and the result's
+        # audit_target / jev_fallback say so.
+        verification = None
+        if verify or os.getenv("GPTR_MCP_VERIFY", "false").strip().lower() in ("1", "true", "yes"):
+            try:
+                verification = await verify_research(researcher, query, context, sources,
+                                                      report=report)
+            except Exception as e:
+                logger.warning(f"Verification pass failed: {e}")
+                # Not None: null means "not requested", and a pass that raised is not that.
+                verification = {"audit_error": f"verification pass raised: {e}",
+                                "audit_engine": "none",
+                                "jev_fallback": "the verification pass raised before "
+                                                "either audit engine ran"}
+                verification["audit_scopes"] = scope_status(report, context, {
+                    ("report" if report else "context"): {
+                        "status": "could_not_audit", "engine": None,
+                        "reason": verification["audit_error"]}})
 
         # Store in the research store for the resource API
         store_research_results(query, context, sources, source_urls)

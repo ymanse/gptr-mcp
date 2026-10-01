@@ -242,3 +242,72 @@ def test_a_context_too_small_to_be_research_is_treated_as_nothing(monkeypatch, t
         "every sub-query failed and the caller is told it succeeded")
     assert out.get("report_written") is False
     assert "NO usable evidence" in out.get("message", "")
+
+
+# ── s26: verification audits the REPORT, so it runs after synthesis ──────────────────
+# Live 2026-10-01: verify_research ran BEFORE write_report, audited the context, found no
+# `[Source: url]` learnings in it (s24's jev gate replaced them with raw passages), spent
+# a Sonnet session and shipped 0 unsupported / 0 contradictions at confidence 0.9.
+def _run_verified(monkeypatch, tmp_path, stub_cls=_Stub, verify_impl=None):
+    events = []
+
+    class _Ordered(stub_cls):
+        async def write_report(self, custom_prompt=None):
+            events.append("write_report")
+            return await super().write_report(custom_prompt)
+
+    async def fake_verify(researcher, query, context, sources, report=None):
+        events.append("verify")
+        events.append(("report", report))
+        if verify_impl:
+            return await verify_impl()
+        return {"source_tiers": {}, "tier_summary": {}, "audit_engine": "jev",
+                "audit_target": "report" if report else "context",
+                "unsupported_claims": [], "contradictions": [],
+                "overall_confidence": 1.0}
+
+    monkeypatch.setenv("GPTR_MCP_OUTPUT_DIR", str(tmp_path))
+    monkeypatch.delenv("GPTR_MCP_OUTPUT_DIR_HOST", raising=False)
+    monkeypatch.setattr(server, "GPTResearcher", _Ordered)
+    monkeypatch.setattr(server, "begin_agent_run", lambda *a, **k: None)
+    monkeypatch.setattr(server, "verify_research", fake_verify)
+    tool = getattr(server.deep_research, "fn", server.deep_research)
+    return asyncio.run(tool(QUERY, verify=True)), events
+
+
+def test_verification_runs_after_synthesis_and_is_given_the_report(monkeypatch, tmp_path):
+    out, events = _run_verified(monkeypatch, tmp_path)
+
+    assert events[:2] == ["write_report", "verify"], (
+        f"verification ran before synthesis ({events}) -- it can only audit the context, "
+        "and a scraped passage always supports itself")
+    assert ("report", REPORT) in events, f"the report was not handed to the audit: {events}"
+    assert out["verification"]["audit_target"] == "report"
+
+
+def test_without_a_report_verification_audits_the_context_and_says_so(monkeypatch,
+                                                                       tmp_path):
+    class _Broken(_Stub):
+        async def write_report(self, custom_prompt=None):
+            raise RuntimeError("report LLM unreachable")
+
+    out, events = _run_verified(monkeypatch, tmp_path, _Broken)
+
+    assert ("report", None) in events, events
+    assert out["report_written"] is False
+    assert out["verification"]["audit_target"] == "context"
+
+
+def test_a_verification_pass_that_raised_is_not_reported_as_not_requested(monkeypatch,
+                                                                          tmp_path):
+    """null means "verify was not asked for"; a pass that blew up must say so instead."""
+    async def boom():
+        raise RuntimeError("tiering exploded")
+
+    out, _ = _run_verified(monkeypatch, tmp_path, verify_impl=boom)
+
+    v = out["verification"]
+    assert v is not None, "a failed verification pass reads as one never requested"
+    assert "tiering exploded" in v["audit_error"] and v["audit_engine"] == "none"
+    assert v["jev_fallback"]
+    assert "unsupported_claims" not in v
