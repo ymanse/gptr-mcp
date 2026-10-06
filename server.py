@@ -580,7 +580,41 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
     success, researcher, error = get_researcher_by_id(mcp.researchers, research_id)
     if not success:
         return error
-    
+
+    # The same floor deep_research refuses at, applied to the id it hands out. deep_research
+    # stores the researcher and returns research_id BEFORE it refuses an empty context, so
+    # write_report on that id used to go straight to the writer: a report from the model's
+    # prior knowledge, persisted with status success. A deep_tree_research id is this case
+    # every time -- the tree researches on per-node GPTResearcher instances and the root's
+    # context is never assigned, so it is always []. The library now abstains on an empty
+    # context too (writer.py, upstream 5d987288), but it abstains with a SENTENCE, which this
+    # tool would have saved to report_path as the report. So refuse here, before the writer
+    # and before arming an allowance: begin_agent_run pools the ceiling and clears a live
+    # provider refusal, and a call that spends nothing has no business doing either.
+    #
+    # Not wrapped in _with_refusal, unlike deep_research's refusal. It attaches whatever
+    # provider refusal was recorded last, and only begin_agent_run clears that -- which
+    # this path never reaches. A session limit hit by any earlier call would be named as
+    # the cause, with a reset time to wait for, when no wait gives this id evidence. A
+    # deep_research run that the limit DID empty already said so in its own response.
+    context = normalize_context(researcher.get_research_context())
+    if len(context.strip()) < MIN_RESEARCH_CONTEXT_CHARS:
+        return {
+            **create_error_response(
+                f"Research gathered NO usable evidence: this research_id holds "
+                f"{len(context.strip())} characters of context (the floor is "
+                f"{MIN_RESEARCH_CONTEXT_CHARS}), so no report was written -- one written now "
+                "would come from the model's prior knowledge, not from sources. If the id "
+                "came from deep_research, run the research again. If it came from "
+                "deep_tree_research, its report is already at the report_path that call "
+                "returned; the tree keeps its evidence per node, not on this id. A "
+                "quick_search id holds search results, not research: use deep_research."),
+            "research_id": research_id,
+            "source_count": len(researcher.get_research_sources() or []),
+            "context_chars": len(context),
+            "report_written": False,
+        }
+
     logger.info(f"Generating report for research ID: {research_id}")
     begin_agent_run(TIERS["standard"]["max_calls"])
 
@@ -600,7 +634,7 @@ async def write_report(research_id: str, custom_prompt: Optional[str] = None) ->
         # evidence file from the same researcher, rather than leaving the caller with a
         # report and no pointer to what it was written from. context_chars is now the
         # research context's size; it used to be the report's, passed in as `context`.
-        context = normalize_context(researcher.get_research_context())
+        # `context` is the one the floor above was checked against.
         artifacts = persist_research_artifacts(
             query, context, sources, source_urls, research_id,
             report_text=report, costs=costs, split=True,
