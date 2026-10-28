@@ -9,10 +9,11 @@ import os
 import sys
 import uuid
 import logging
+from datetime import timedelta
 from typing import Dict, Any, Optional, List
 from dotenv import load_dotenv
 from fastapi.responses import JSONResponse
-from fastmcp import FastMCP
+from fastmcp import Context, FastMCP
 from gpt_researcher import GPTResearcher
 
 # Load environment variables
@@ -96,6 +97,61 @@ logger = logging.getLogger(__name__)
 mcp = FastMCP(
     name="GPT Researcher"
 )
+
+# MCP Tasks (io.modelcontextprotocol/tasks, SEP-2663) for the two research tools.
+# Measured 2026-10-28 from session transcripts: deep_research p50 121s / max 770s,
+# deep_tree_research p50 121s, every call past 60s. Held as one tools/call, such a run
+# ties up one HTTP request for its whole length -- the shape behind the s14 "transport
+# dropped mid-call" deaths at 20 minutes. As a task the call returns a handle at once and
+# the client polls tasks/get, so no request lives longer than one poll.
+#
+# "optional", not "required": a caller that did not declare the extension (a Claude Code
+# subagent, `claude -p`, a legacy-era connection) gets the old synchronous call. Required
+# would hand those callers -32021 instead of research.
+#
+# Guarded like the claude_agent import above: on an image without fastmcp-tasks (or the
+# host test venv, which carries FastMCP 2.x) the tools stay synchronous rather than the
+# server refusing to start. GPTR_MCP_TASKS=false turns it off without a rebuild.
+RESEARCH_TASK: Any = False
+if os.getenv("GPTR_MCP_TASKS", "true").strip().lower() not in ("0", "false", "no"):
+    try:
+        from fastmcp.utilities.tasks import TaskConfig
+        from fastmcp_tasks import TasksExtension
+    except ImportError:
+        logger.info("fastmcp-tasks not installed: research tools answer synchronously")
+    else:
+        # memory:// (the default backend) runs the worker in this process, so a task
+        # dies with the container either way and redelivery to "another worker" has no
+        # one to go to. What redelivery CAN still do here is run a research a second
+        # time: Docket renews the lease every redelivery_timeout/4, and an event loop
+        # stalled past the timeout (s14: a sync retriever on the loop did exactly that)
+        # would re-queue a run that is still going, at double the agent sessions. The
+        # default 300s is shorter than a normal deep run, so it is raised well past the
+        # longest one measured (1500s budget + synthesis).
+        mcp.add_extension(TasksExtension(redelivery_timeout=timedelta(hours=2)))
+        # 10s: a research run moves in minutes, and Claude Code clamps 250ms-30s.
+        RESEARCH_TASK = TaskConfig(mode="optional", poll_interval=timedelta(seconds=10))
+
+
+async def _report_phase(ctx: Optional[Context], step: int, message: str) -> None:
+    """Name the current phase of a long call, best effort.
+
+    Inside a task this lands in tasks/get as statusMessage; in a foreground call that
+    carries a progress token it goes out as a progress notification, which is also what
+    keeps an HTTP client's idle timer from firing. Never raises: a run must not die over
+    its own status line.
+
+    `ctx` is the tool's injected Context, not get_context(): measured 2026-10-28, inside
+    a Docket task worker get_context() raises "No active context found" while the
+    injected parameter is there. A test calling the function directly passes none.
+    """
+    if ctx is None:
+        return
+    try:
+        await ctx.report_progress(step, message=message)
+    except Exception as e:
+        logger.debug(f"progress report failed: {e}")
+
 
 # Initialize researchers dictionary
 if not hasattr(mcp, "researchers"):
@@ -212,8 +268,8 @@ def _partial_banner(researcher) -> str:
               "examined, which is not evidence that it does not matter.\n\n")
 
 
-@mcp.tool()
-async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False, scope: bool = False, time_budget_s: Optional[float] = None) -> Dict[str, Any]:
+@mcp.tool(task=RESEARCH_TASK)
+async def deep_research(query: str, retriever: str = "smart", multi_llm_review: bool = False, verify: bool = False, scope: bool = False, time_budget_s: Optional[float] = None, ctx: Optional[Context] = None) -> Dict[str, Any]:
     """
     Conduct a web deep research on a given query using GPT Researcher.
     Use this tool when you need time-sensitive, real-time information like stock prices, news, people, specific knowledge, etc.
@@ -274,6 +330,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
 
     # Start research
     try:
+        await _report_phase(ctx, 1, "researching")
         await researcher.conduct_research(scope=scope)
         mcp.researchers[research_id] = researcher
         logger.info(f"Research completed for ID: {research_id}")
@@ -318,6 +375,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         # persisted and returned below, and the failure is named in the response.
         # write_report stays available to re-synthesize with a custom prompt.
         report, report_error = None, None
+        await _report_phase(ctx, 2, f"writing report from {len(sources)} sources")
         try:
             report = await researcher.write_report()
         except Exception as e:
@@ -337,6 +395,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         # audit_target / jev_fallback say so.
         verification = None
         if verify or os.getenv("GPTR_MCP_VERIFY", "false").strip().lower() in ("1", "true", "yes"):
+            await _report_phase(ctx, 3, "verifying citations")
             try:
                 verification = await verify_research(researcher, query, context, sources,
                                                       report=report)
@@ -399,7 +458,7 @@ async def deep_research(query: str, retriever: str = "smart", multi_llm_review: 
         return _with_refusal(handle_exception(e, "Research"))
 
 
-@mcp.tool()
+@mcp.tool(task=RESEARCH_TASK)
 async def deep_tree_research(
     query: str,
     max_depth: int = 3,
@@ -412,6 +471,7 @@ async def deep_tree_research(
     stream: bool = False,
     time_budget_s: float = 600,
     depth: Optional[str] = None,
+    ctx: Optional[Context] = None,
 ) -> Dict[str, Any]:
     """
     Conduct tree-structured deep research: the answer to each research question spawns
@@ -486,6 +546,8 @@ async def deep_tree_research(
 
     try:
         out_dir = get_output_dir()
+        await _report_phase(ctx, 1, f"expanding research tree (tier {tier_name}, "
+                               f"up to {max_nodes} nodes, {time_budget_s:.0f}s)")
         result = await skill.run(
             query=query, max_depth=max_depth, max_breadth=max_breadth,
             max_nodes=max_nodes, token_budget=token_budget, credit_budget=credit_budget,

@@ -10,7 +10,9 @@ ddgs  # DuckDuckGo retriever (keyless fallback when Tavily fails / no API key)
 claude-agent-sdk>=0.1.48
 
 # MCP dependencies
-fastmcp>=2.8.0
+# Pinned to the version the running image already had (2026-10-28): fastmcp-tasks pins
+# fastmcp-slim to its own exact version, so the two move together or not at all.
+fastmcp==4.0.5
 fastapi>=0.103.1
 uvicorn>=0.23.2
 pydantic>=2.3.0
@@ -32,3 +34,11 @@ exa-py>=1.0.0
 # CDP to the `lightpanda` container, which renders DOM+JS without a rendering engine at
 # ~5MB resident. See gpt_researcher/scraper/lightpanda/.
 playwright
+
+# MCP Tasks (io.modelcontextprotocol/tasks) for deep_research / deep_tree_research: the
+# research call returns a task handle and the client polls tasks/get (server.py,
+# RESEARCH_TASK). Same version as fastmcp above -- it pins fastmcp-slim exactly.
+fastmcp-tasks==4.0.5
+# 4.0.5 does not exclude it, but fastmcp-tasks 4.1.x does (`redis!=8.1.0`), and an
+# unpinned resolve picked exactly 8.1.0 here (pip --dry-run, 2026-10-28).
+redis!=8.1.0
