@@ -26,3 +26,9 @@ sseclient-py>=1.7.0
 # retriever retires itself at the first search ("Unable to import exa-py") and the
 # bundle silently narrows. Measured 2026-09-05: citations 11 -> 4 on a technical query.
 exa-py>=1.0.0
+
+# Playwright CLIENT only -- no `playwright install`, so no browser binaries in this
+# image (~137MB for the library against ~1GB for a Chromium bundle). It connects over
+# CDP to the `lightpanda` container, which renders DOM+JS without a rendering engine at
+# ~5MB resident. See gpt_researcher/scraper/lightpanda/.
+playwright
